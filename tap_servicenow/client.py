@@ -5,6 +5,7 @@ import requests
 from requests import session
 from requests.exceptions import Timeout, ConnectionError, ChunkedEncodingError
 from singer import get_logger, metrics
+from requests.auth import HTTPBasicAuth
 
 from tap_servicenow.exceptions import ERROR_CODE_EXCEPTION_MAPPING, ServiceNowError, ServiceNowBackoffError
 
@@ -60,11 +61,36 @@ class Client:
         self._session.close()
 
     def check_api_credentials(self) -> None:
-        pass
+        """Test the credentials by calling a simple authenticated endpoint."""
+        try:
+            test_endpoint = f"{self.base_url}/table/sys_user?sysparm_limit=1"
+            LOGGER.info("Testing API credentials with endpoint: %s", test_endpoint)
+
+            headers = {"Accept": "application/json"}
+            params = {}
+            headers, params = self.authenticate(headers, params)
+
+            response = self._session.get(
+                test_endpoint,
+                headers=headers,
+                params=params,
+                auth=self._session.auth,
+                timeout=self.request_timeout
+            )
+
+            raise_for_error(response)
+            LOGGER.info("Successfully authenticated with ServiceNow API.")
+
+        except Exception as e:
+            LOGGER.error("Failed to authenticate with ServiceNow API: %s", str(e))
+            raise
 
     def authenticate(self, headers: Dict, params: Dict) -> Tuple[Dict, Dict]:
-        """Authenticates the request with the token"""
-        headers[""] = self.config[""]
+        """Authenticates the request with basic auth headers."""
+        self._session.auth = HTTPBasicAuth(
+            self.config["user"],
+            self.config["password"]
+        )
         return headers, params
 
     def make_request(

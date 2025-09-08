@@ -40,8 +40,12 @@ class BaseStream(ABC):
     def __init__(self, client=None, catalog=None) -> None:
         self.client = client
         self.catalog = catalog
-        self.schema = catalog.schema.to_dict()
-        self.metadata = metadata.to_map(catalog.metadata)
+        if catalog:
+            self.schema = catalog.schema.to_dict()
+            self.metadata = metadata.to_map(catalog.metadata)
+        else:
+            self.schema = {"type": "object", "properties": {}}
+            self.metadata = metadata.new()
         self.child_to_sync = []
         self.params = {}
         self.data_payload = {}
