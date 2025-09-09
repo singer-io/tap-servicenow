@@ -12,6 +12,9 @@ from singer import (
     metadata
 )
 
+import time
+from tap_servicenow.exceptions import ServiceNowForbiddenError
+
 LOGGER = get_logger()
 
 
@@ -100,25 +103,47 @@ class BaseStream(ABC):
          - https://github.com/singer-io/getting-started/blob/master/docs/SYNC_MODE.md
         """
 
-
     def get_records(self) -> Iterator:
-        """Interacts with api client interaction and pagination."""
-        # self.params["sysparm_offset"] = self.page_size
-        next_page = 1
-        while next_page:
-            response = self.client.make_request(
-                self.http_method,
-                self.url_endpoint,
-                {},
-                self.headers,
-                body=json.dumps(self.data_payload),
-                path=self.path
-            )
-            raw_records = response.get(self.data_key, [])
-            next_page = response.get(self.next_page_key)
+        """Interacts with API client with pagination and rate limiting."""
+        offset = 0
+        page_size = self.page_size or 100
+        has_more = True
 
-            self.params[self.next_page_key] = next_page
-            yield from raw_records
+        while has_more:
+            try:
+                # Set pagination parameters
+                self.params.update({
+                    "sysparm_offset": offset,
+                    "sysparm_limit": page_size
+                })
+
+                response = self.client.make_request(
+                    self.http_method,
+                    self.url_endpoint,
+                    self.params,
+                    self.headers,
+                    body=json.dumps(self.data_payload),
+                    path=self.path
+                )
+                raw_records = response.get(self.data_key, [])
+                yield from raw_records
+
+                if len(raw_records) < page_size:
+                    has_more = False
+                else:
+                    offset += page_size
+
+                if hasattr(self, "rate_limit_sleep") and self.rate_limit_sleep:
+                    time.sleep(self.rate_limit_sleep)
+
+            except ServiceNowForbiddenError as e:
+                LOGGER.critical(f"403 Forbidden on {self.url_endpoint}: {e}")
+                break
+
+            except Exception as e:
+                LOGGER.error(f"Unexpected error while fetching records: {e}")
+                raise
+
 
     def write_schema(self) -> None:
         """

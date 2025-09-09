@@ -137,15 +137,16 @@ class DynamicServiceNowTableStream(IncrementalStream):
         return mapping.get(snow_type.lower(), ["string", "null"])
 
 
-def get_all_tables(client, page_size=100, max_tables=100) -> List[str]:
+def get_all_tables(client, page_size=100, max_tables: int = None) -> List[str]:
     """
-    Paginate through sys_db_object to get up to `max_tables` available table names.
+    Paginate through sys_db_object to get up to `max_tables` table names.
+    If `max_tables` is None, it fetches all tables (production mode).
     """
     all_tables = []
     offset = 0
     seen = set()
 
-    while len(all_tables) < max_tables:
+    while True:
         params = {
             "sysparm_offset": offset,
             "sysparm_limit": page_size
@@ -169,12 +170,13 @@ def get_all_tables(client, page_size=100, max_tables=100) -> List[str]:
             break
 
         for name in new_names:
-            if len(all_tables) >= max_tables:
-                break
+            if max_tables is not None and len(all_tables) >= max_tables:
+                LOGGER.info(f"Reached max_tables={max_tables} limit. Ending.")
+                return all_tables
             all_tables.append(name)
             seen.add(name)
 
         offset += len(records)
 
-    LOGGER.info(f"Returning {len(all_tables)} tables for testing.")
+    LOGGER.info(f"Returning {len(all_tables)} tables.")
     return all_tables
