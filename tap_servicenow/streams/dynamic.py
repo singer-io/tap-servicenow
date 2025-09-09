@@ -30,13 +30,10 @@ class DynamicServiceNowTableStream(IncrementalStream):
     @property
     def schema_dict(self) -> Dict:
         full_schema = self._dynamic_schema.to_dict()
-        # Unwrap the "type" key if it exists and contains "properties"
         if "type" in full_schema and isinstance(full_schema["type"], dict):
-            # Extract the properties dict inside the nested "type"
             inner = full_schema["type"]
             if "properties" in inner:
                 return {"properties": inner["properties"]}
-        # Fallback: return the original dict if no wrapping found
         return full_schema
     
     @property
@@ -131,7 +128,7 @@ class DynamicServiceNowTableStream(IncrementalStream):
             "html": {"type": ["string", "null"]},
             "url": {"type": ["string", "null"]},
             "email": {"type": ["string", "null"]},
-            # Add more as needed
+            # Add as per need
         }
 
         return mapping.get(snow_type.lower(), ["string", "null"])
@@ -152,7 +149,6 @@ def get_all_tables(client, page_size=100, max_tables: int = None) -> List[str]:
             "sysparm_limit": page_size
         }
 
-        LOGGER.info(f"Fetching ServiceNow tables at offset {offset}")
         response = client.make_request(
             method="GET",
             endpoint=f"{client.base_url}/table/sys_db_object",
@@ -161,22 +157,18 @@ def get_all_tables(client, page_size=100, max_tables: int = None) -> List[str]:
 
         records = response.get("result", [])
         if not records:
-            LOGGER.info("Received empty batch. Ending pagination.")
             break
 
         new_names = [r["name"] for r in records if "name" in r and r["name"] not in seen]
         if not new_names:
-            LOGGER.info("No new table names discovered. Ending.")
             break
 
         for name in new_names:
             if max_tables is not None and len(all_tables) >= max_tables:
-                LOGGER.info(f"Reached max_tables={max_tables} limit. Ending.")
                 return all_tables
             all_tables.append(name)
             seen.add(name)
 
         offset += len(records)
 
-    LOGGER.info(f"Returning {len(all_tables)} tables.")
     return all_tables

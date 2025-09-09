@@ -21,21 +21,20 @@ def discover(client) -> Catalog:
         # Start metadata for stream-level
         md = metadata.new()
 
-        # Write stream-level metadata
         md = metadata.write(md, (), 'table-key-properties', list(stream.key_properties))
-        md = metadata.write(md, (), 'selected', True)
         md = metadata.write(md, (), 'replication-method', stream.replication_method)
         md = metadata.write(md, (), 'forced-replication-method', stream.replication_method)
-        md = metadata.write(md, (), 'inclusion', 'available')  # Include stream-level
+        md = metadata.write(md, (), 'inclusion', 'automatic')
 
-        LOGGER.info("%s", metadata.to_list(md))
-        # Build catalog entry
+        for field_name in stream.schema_dict.get("properties", {}):
+            md = metadata.write(md, ("properties", field_name), "inclusion", "automatic")
+
         catalog_entry = CatalogEntry(
-            stream=table_name,
-            tap_stream_id=table_name,
+            stream=stream.name,
+            tap_stream_id=stream.tap_stream_id,
             key_properties=stream.key_properties,
             schema=stream.schema,
-            metadata=metadata.to_list(md),  # Convert metadata map to list for Singer
+            metadata=metadata.to_list(md),
             replication_method=stream.replication_method
         )
         streams.append(catalog_entry)
