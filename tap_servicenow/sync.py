@@ -2,6 +2,9 @@ import singer
 from typing import Dict
 from tap_servicenow.streams import STREAMS
 from tap_servicenow.client import Client
+from tap_servicenow.streams import register_dynamic_stream
+from tap_servicenow.streams.dynamic import DynamicServiceNowTableStream
+
 
 LOGGER = singer.get_logger()
 
@@ -44,10 +47,22 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
     last_stream = singer.get_currently_syncing(state)
     LOGGER.info("last/currently syncing stream: {}".format(last_stream))
 
+    # Register dynamic streams before syncing
+    for stream_name in streams_to_sync:
+        if stream_name not in STREAMS:
+            register_dynamic_stream(stream_name)
+
     with singer.Transformer() as transformer:
         for stream_name in streams_to_sync:
+            catalog_entry = catalog.get_stream(stream_name)
 
-            stream = STREAMS[stream_name](client, catalog.get_stream(stream_name))
+            # Check if this is a dynamic stream
+            stream_cls = STREAMS[stream_name]
+            if stream_cls is DynamicServiceNowTableStream:
+                stream = stream_cls(client, catalog_entry, stream_name)
+            else:
+                stream = stream_cls(client, catalog_entry)
+
             if stream.parent:
                 if stream.parent not in streams_to_sync:
                     streams_to_sync.append(stream.parent)

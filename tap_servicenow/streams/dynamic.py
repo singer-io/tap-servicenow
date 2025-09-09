@@ -1,19 +1,19 @@
 from typing import Dict, List, Tuple, Optional
-from tap_servicenow.streams.abstracts import FullTableStream
+from tap_servicenow.streams.abstracts import IncrementalStream
 from singer import metadata, get_logger
 from singer.schema import Schema
 
 LOGGER = get_logger()
 
 
-class DynamicServiceNowTableStream(FullTableStream):
+class DynamicServiceNowTableStream(IncrementalStream):
     def __init__(self, client, catalog_entry: Optional[dict], table_name: str):
         self.table_name = table_name
         self.name = table_name
         self.path = f"table/{table_name}"
         super().__init__(client, catalog_entry)
-
-        self._dynamic_schema = Schema(self.get_schema())
+        self._raw_schema = self.get_schema()
+        self._dynamic_schema = Schema(self._raw_schema)
 
         if catalog_entry:
             self.metadata = metadata.to_map(catalog_entry.metadata)
@@ -22,13 +22,22 @@ class DynamicServiceNowTableStream(FullTableStream):
 
     @property
     def schema(self) -> Schema:
-        if isinstance(self._dynamic_schema, Schema):
-            return self._dynamic_schema
-        return Schema(self._dynamic_schema or {"type": "object", "properties": {}})
-    
+        return self._dynamic_schema
     @schema.setter
     def schema(self, value: Dict) -> None:
         self._dynamic_schema = Schema(value)
+        
+    @property
+    def schema_dict(self) -> Dict:
+        full_schema = self._dynamic_schema.to_dict()
+        # Unwrap the "type" key if it exists and contains "properties"
+        if "type" in full_schema and isinstance(full_schema["type"], dict):
+            # Extract the properties dict inside the nested "type"
+            inner = full_schema["type"]
+            if "properties" in inner:
+                return {"properties": inner["properties"]}
+        # Fallback: return the original dict if no wrapping found
+        return full_schema
     
     @property
     def tap_stream_id(self) -> str:
@@ -36,11 +45,15 @@ class DynamicServiceNowTableStream(FullTableStream):
 
     @property
     def replication_method(self) -> str:
-        return "FULL_TABLE"
+        return "INCREMENTAL"
 
     @property
-    def key_properties(self) -> Tuple[str]:
-        return ("sys_id",)
+    def key_properties(self) -> list:
+        return ["sys_id"]
+
+    @property
+    def replication_keys(self) -> list:
+        return ["sys_updated_on"]
 
     def get_schema(self) -> Dict:
         """
@@ -105,26 +118,26 @@ class DynamicServiceNowTableStream(FullTableStream):
         Map ServiceNow field types to JSON Schema types.
         """
         mapping = {
-            "string": ["string", "null"],
-            "glide_date_time": ["string", "null"],
-            "glide_date": ["string", "null"],
-            "int": ["integer", "null"],
-            "integer": ["integer", "null"],
-            "float": ["number", "null"],
-            "boolean": ["boolean", "null"],
-            "reference": ["string", "null"],
-            "currency": ["number", "null"],
-            "text": ["string", "null"],
-            "html": ["string", "null"],
-            "url": ["string", "null"],
-            "email": ["string", "null"],
-            # Add more mappings as needed
+            "string": {"type": ["string", "null"]},
+            "glide_date_time": {"type": ["string", "null"], "format": "date-time"},
+            "glide_date": {"type": ["string", "null"], "format": "date-time"},
+            "int": {"type": ["integer", "null"]},
+            "integer": {"type": ["integer", "null"]},
+            "float": {"type": ["number", "null"]},
+            "boolean": {"type": ["boolean", "null"]},
+            "reference": {"type": ["string", "null"]},
+            "currency": {"type": ["number", "null"]},
+            "text": {"type": ["string", "null"]},
+            "html": {"type": ["string", "null"]},
+            "url": {"type": ["string", "null"]},
+            "email": {"type": ["string", "null"]},
+            # Add more as needed
         }
 
         return mapping.get(snow_type.lower(), ["string", "null"])
 
 
-def get_all_tables(client, page_size=100, max_tables=1) -> List[str]:
+def get_all_tables(client, page_size=100, max_tables=100) -> List[str]:
     """
     Paginate through sys_db_object to get up to `max_tables` available table names.
     """

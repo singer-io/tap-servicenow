@@ -26,21 +26,7 @@ def discover(client) -> Catalog:
         md = metadata.write(md, (), 'selected', True)
         md = metadata.write(md, (), 'replication-method', stream.replication_method)
         md = metadata.write(md, (), 'forced-replication-method', stream.replication_method)
-        md = metadata.write(md, (), 'valid-replication-keys', [])
         md = metadata.write(md, (), 'inclusion', 'available')  # Include stream-level
-
-        # Property-level metadata
-        LOGGER.info(f"Schema type: {type(stream.schema)}")
-        properties = stream.schema.properties or {}
-        LOGGER.info(f"Schema properties for {table_name}: {list(properties.keys())}")
-
-        for field in properties:
-            inclusion = 'automatic' if field in stream.key_properties else 'available'
-            md = metadata.write(md, ('properties', field), 'inclusion', inclusion)
-
-        for field in properties:
-            inclusion = 'automatic' if field in stream.key_properties else 'available'
-            md = metadata.write(md, ('properties', field), 'inclusion', inclusion)
 
         LOGGER.info("%s", metadata.to_list(md))
         # Build catalog entry

@@ -33,9 +33,9 @@ class BaseStream(ABC):
     headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
     children = []
     parent = ""
-    data_key = ""
+    data_key = "result"
     parent_bookmark_key = ""
-    http_method = "POST"
+    http_method = "GET"
 
     def __init__(self, client=None, catalog=None) -> None:
         self.client = client
@@ -103,13 +103,13 @@ class BaseStream(ABC):
 
     def get_records(self) -> Iterator:
         """Interacts with api client interaction and pagination."""
-        self.params["sysparm_offset"] = self.page_size
+        # self.params["sysparm_offset"] = self.page_size
         next_page = 1
         while next_page:
             response = self.client.make_request(
                 self.http_method,
                 self.url_endpoint,
-                self.params,
+                {},
                 self.headers,
                 body=json.dumps(self.data_payload),
                 path=self.path
@@ -125,7 +125,7 @@ class BaseStream(ABC):
         Write a schema message.
         """
         try:
-            write_schema(self.tap_stream_id, self.schema, self.key_properties)
+            write_schema(self.tap_stream_id, self.schema_dict, self.key_properties)
         except OSError as err:
             LOGGER.error(
                 "OS Error while writing schema for: {}".format(self.tap_stream_id)
@@ -194,14 +194,16 @@ class IncrementalStream(BaseStream):
         bookmark_date = self.get_bookmark(state, self.tap_stream_id)
         current_max_bookmark_date = bookmark_date
         self.update_params(updated_since=bookmark_date)
-        self.update_data_payload(parent_obj)
+        if parent_obj:
+            self.update_data_payload(**parent_obj)
+
         self.url_endpoint = self.get_url_endpoint(parent_obj)
 
         with metrics.record_counter(self.tap_stream_id) as counter:
             for record in self.get_records():
                 record = self.modify_object(record, parent_obj)
                 transformed_record = transformer.transform(
-                    record, self.schema, self.metadata
+                    record, self.schema_dict, self.metadata
                 )
 
                 record_bookmark = transformed_record[self.replication_keys[0]]
@@ -234,11 +236,10 @@ class FullTableStream(BaseStream):
     ) -> Dict:
         """Abstract implementation for `type: Fulltable` stream."""
         self.url_endpoint = self.get_url_endpoint(parent_obj)
-        self.update_data_payload(parent_obj)
         with metrics.record_counter(self.tap_stream_id) as counter:
             for record in self.get_records():
                 transformed_record = transformer.transform(
-                    record, self.schema, self.metadata
+                    record, self.schema_dict, self.metadata
                 )
                 if self.is_selected():
                     write_record(self.tap_stream_id, transformed_record)
