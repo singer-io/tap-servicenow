@@ -200,27 +200,32 @@ class IncrementalStream(BaseStream):
         self.url_endpoint = self.get_url_endpoint(parent_obj)
 
         with metrics.record_counter(self.tap_stream_id) as counter:
-            for record in self.get_records():
-                record = self.modify_object(record, parent_obj)
-                transformed_record = transformer.transform(
-                    record, self.schema_dict, self.metadata
-                )
-
-                record_bookmark = transformed_record[self.replication_keys[0]]
-                if record_bookmark >= bookmark_date:
-                    if self.is_selected():
-                        write_record(self.tap_stream_id, transformed_record)
-                        counter.increment()
-
-                    current_max_bookmark_date = max(
-                        current_max_bookmark_date, record_bookmark
+            try:
+                for record in self.get_records():
+                    record = self.modify_object(record, parent_obj)
+                    transformed_record = transformer.transform(
+                        record, self.schema_dict, self.metadata
                     )
 
-                    for child in self.child_to_sync:
-                        child.sync(state=state, transformer=transformer, parent_obj=record)
+                    record_bookmark = transformed_record[self.replication_keys[0]]
+                    if record_bookmark >= bookmark_date:
+                        if self.is_selected():
+                            write_record(self.tap_stream_id, transformed_record)
+                            counter.increment()
 
-            state = self.write_bookmark(state, self.tap_stream_id, value=current_max_bookmark_date)
-            return counter.value
+                        current_max_bookmark_date = max(
+                            current_max_bookmark_date, record_bookmark
+                        )
+
+                        for child in self.child_to_sync:
+                            child.sync(state=state, transformer=transformer, parent_obj=record)
+
+            except Exception as e:
+                LOGGER.critical(f"Skipping stream '{self.tap_stream_id}' due to : {e}")
+                return 0
+
+        state = self.write_bookmark(state, self.tap_stream_id, value=current_max_bookmark_date)
+        return counter.value
 
 
 class FullTableStream(BaseStream):

@@ -7,7 +7,7 @@ from tap_servicenow.sync import sync
 
 LOGGER = singer.get_logger()
 
-REQUIRED_CONFIG_KEYS = ['instance', 'user', 'password']
+REQUIRED_CONFIG_KEYS = ['instance', 'user', 'password', 'start_date']
 
 
 def do_discover(client):
