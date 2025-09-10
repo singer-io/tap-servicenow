@@ -150,7 +150,7 @@ class BaseStream(ABC):
         Write a schema message.
         """
         try:
-            write_schema(self.tap_stream_id, self.schema_dict, self.key_properties)
+            write_schema(self.tap_stream_id, self.schema, self.key_properties)
         except OSError as err:
             LOGGER.error(
                 "OS Error while writing schema for: {}".format(self.tap_stream_id)
@@ -229,7 +229,7 @@ class IncrementalStream(BaseStream):
                 for record in self.get_records():
                     record = self.modify_object(record, parent_obj)
                     transformed_record = transformer.transform(
-                        record, self.schema_dict, self.metadata
+                        record, self.schema, self.metadata
                     )
 
                     record_bookmark = transformed_record[self.replication_keys[0]]
@@ -269,7 +269,7 @@ class FullTableStream(BaseStream):
         with metrics.record_counter(self.tap_stream_id) as counter:
             for record in self.get_records():
                 transformed_record = transformer.transform(
-                    record, self.schema_dict, self.metadata
+                    record, self.schema, self.metadata
                 )
                 if self.is_selected():
                     write_record(self.tap_stream_id, transformed_record)

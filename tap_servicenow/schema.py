@@ -4,6 +4,7 @@ import singer
 from typing import Dict, Tuple
 from singer import metadata
 from tap_servicenow.streams import STREAMS
+from tap_servicenow.streams import get_all_tables, servicenow_type_to_json_type
 
 LOGGER = singer.get_logger()
 
@@ -74,3 +75,91 @@ def get_schemas() -> Tuple[Dict, Dict]:
 
     return schemas, field_metadata
 
+
+def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
+    """
+    Fetch dynamic schemas and metadata for all ServiceNow tables.
+    Returns:
+        Tuple[Dict, Dict]: (schemas, field_metadata)
+    """
+    LOGGER.info("Fetching dynamic schema from ServiceNow.")
+    schemas = {}
+    field_metadata = {}
+
+    # Step 1: Get all table names from sys_db_object
+    table_names = get_all_tables(client)  # make sure you defined this helper already
+
+    for table in table_names:
+        try:
+            LOGGER.info(f"Processing table: {table}")
+
+            # Step 2: Fetch schema fields from sys_dictionary
+            params = {
+                "sysparm_query": f"name={table}",
+                "sysparm_fields": "element,internal_type",
+                "sysparm_limit": 1000
+            }
+
+            response = client.make_request(
+                method="GET",
+                endpoint=f"{client.base_url}/sys_dictionary",
+                params=params
+            )
+
+            fields = response.get("result", [])
+            if not fields:
+                LOGGER.warning(f"No fields found for table: {table}. Skipping.")
+                continue
+
+            properties = {}
+            for field in fields:
+                name = field.get("element")
+                snow_type = field.get("internal_type")
+
+                # Unwrap if needed
+                if isinstance(snow_type, dict):
+                    snow_type = snow_type.get("value")
+
+                if not name or not snow_type:
+                    continue
+
+                json_type = servicenow_type_to_json_type(snow_type)
+                properties[name] = json_type
+
+            # Ensure sys_id is included
+            if "sys_id" not in properties:
+                properties["sys_id"] = {"type": ["string", "null"]}
+
+            # Create schema dict
+            schema = {
+                "type": "object",
+                "properties": properties
+            }
+
+            # Add to schemas
+            schemas[table] = schema
+
+            # Create singer metadata
+            mdata = metadata.new()
+            mdata = metadata.get_standard_metadata(
+                schema=schema,
+                key_properties=["sys_id"],
+                valid_replication_keys=["sys_updated_on"],
+                replication_method="INCREMENTAL"
+            )
+
+            # Mark sys_updated_on as automatic
+            mdata = metadata.to_map(mdata)
+            if "sys_updated_on" in properties:
+                mdata = metadata.write(
+                    mdata, ("properties", "sys_updated_on"), "inclusion", "automatic"
+                )
+
+            # Add to field metadata
+            field_metadata[table] = metadata.to_list(mdata)
+
+        except Exception as e:
+            LOGGER.error(f"Failed to fetch schema for table {table}: {str(e)}")
+            continue
+
+    return schemas, field_metadata

@@ -1,7 +1,9 @@
+from typing import Dict
 import singer
 from singer import metadata
-from singer.catalog import Catalog, CatalogEntry
-from tap_servicenow.streams.dynamic import get_all_tables, DynamicServiceNowTableStream
+from singer.catalog import Catalog, CatalogEntry, Schema
+from tap_servicenow.schema import get_dynamic_schema
+from tap_servicenow.client import Client
 
 LOGGER = singer.get_logger()
 
@@ -12,33 +14,29 @@ def discover(client) -> Catalog:
 
     LOGGER.info("Starting dynamic discovery of ServiceNow tables")
 
-    table_names = get_all_tables(client)
-    streams = []
+    dynamic_schemas, dynamic_field_metadata = get_dynamic_schema(client)
+    catalog = Catalog([])
 
-    for table_name in table_names:
-        stream = DynamicServiceNowTableStream(client, None, table_name)
+    for stream_name, schema_dict in dynamic_schemas.items():
+        try:
+            schema = Schema.from_dict(schema_dict)
+            mdata = dynamic_field_metadata[stream_name]
+        except Exception as err:
+            LOGGER.error(err)
+            LOGGER.error("stream_name: {}".format(stream_name))
+            LOGGER.error("type schema_dict: {}".format(type(schema_dict)))
+            raise err
 
-        # Start metadata for stream-level
-        md = metadata.new()
+        key_properties = metadata.to_map(mdata).get((), {}).get("table-key-properties")
 
-        md = metadata.write(md, (), 'table-key-properties', list(stream.key_properties))
-        md = metadata.write(md, (), 'replication-method', stream.replication_method)
-        md = metadata.write(md, (), 'forced-replication-method', stream.replication_method)
-        md = metadata.write(md, (), 'inclusion', 'automatic')
-        md = metadata.write(md, (), 'selected', 'true')
-
-        for field_name in stream.schema_dict.get("properties", {}):
-            md = metadata.write(md, ("properties", field_name), "inclusion", "automatic")
-
-        catalog_entry = CatalogEntry(
-            stream=stream.name,
-            tap_stream_id=stream.tap_stream_id,
-            key_properties=stream.key_properties,
-            schema=stream.schema,
-            metadata=metadata.to_list(md),
-            replication_method=stream.replication_method
+        catalog.streams.append(
+            CatalogEntry(
+                stream=stream_name,
+                tap_stream_id=stream_name,
+                key_properties=key_properties,
+                schema=schema,
+                metadata=mdata,
+            )
         )
-        streams.append(catalog_entry)
 
-    LOGGER.info(f"Discovered {len(streams)} tables")
-    return Catalog(streams=streams)
+    return catalog

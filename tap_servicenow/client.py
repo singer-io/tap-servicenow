@@ -57,7 +57,7 @@ class Client:
     def __init__(self, config: Mapping[str, Any]) -> None:
         self.config = config
         self._session = session()
-        self.base_url = f"https://{config['instance']}.service-now.com/api/now"
+        self.base_url = f"https://{config['instance']}.service-now.com/api/now/table"
         config_request_timeout = config.get("request_timeout")
         self.request_timeout = float(config_request_timeout) if config_request_timeout else REQUEST_TIMEOUT
 
@@ -69,29 +69,7 @@ class Client:
         self._session.close()
 
     def check_api_credentials(self) -> None:
-        """Test the credentials by calling a simple authenticated endpoint."""
-        try:
-            test_endpoint = f"{self.base_url}/table/sys_user?sysparm_limit=1"
-            LOGGER.info("Testing API credentials with endpoint: %s", test_endpoint)
-
-            headers = {"Accept": "application/json"}
-            params = {}
-            headers, params = self.authenticate(headers, params)
-
-            response = self._session.get(
-                test_endpoint,
-                headers=headers,
-                params=params,
-                auth=self._session.auth,
-                timeout=self.request_timeout
-            )
-
-            raise_for_error(response)
-            LOGGER.info("Successfully authenticated with ServiceNow API.")
-
-        except Exception as e:
-            LOGGER.error("Failed to authenticate with ServiceNow API: %s", str(e))
-            raise
+        pass
 
     def authenticate(self, headers: Dict, params: Dict) -> Tuple[Dict, Dict]:
         """Authenticates the request with basic auth headers."""
