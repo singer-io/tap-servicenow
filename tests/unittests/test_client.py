@@ -68,22 +68,6 @@ class TestClient(unittest.TestCase):
         assert client.request_timeout == expected_value
         assert isinstance(client._session, mock_session().__class__)
 
-
-    # @patch("tap_servicenow.client.Client._Client__make_request")
-    # def test_client_get(self, mock_make_request):
-    #     mock_make_request.return_value = {"data": "ok"}
-    #     result = self.client.get("https://api.example.com/resource")
-    #     assert result == {"data": "ok"}
-    #     mock_make_request.assert_called_once()
-
-
-    # @patch("tap_servicenow.client.Client._Client__make_request")
-    # def test_client_post(self, mock_make_request):
-    #     mock_make_request.return_value = {"created": True}
-    #     result = self.client.post("https://api.example.com/resource", body={"key": "value"})
-    #     assert result == {"created": True}
-    #     mock_make_request.assert_called_once()
-
     @parameterized.expand([
         ["400 error", 400, MockResponse(400), ServiceNowBadRequestError, "A validation exception has occurred."],
         ["401 error", 401, MockResponse(401), ServiceNowUnauthorizedError, "The access token provided is expired, revoked, malformed or invalid for other reasons."],

@@ -26,35 +26,6 @@ class TestSync(unittest.TestCase):
         mock_stream.write_schema.assert_called_once()
         self.assertEqual(len(mock_stream.child_to_sync), 0)
 
-    # def test_write_schema_parent_child_both_selected(self):
-    #     mock_stream = MagicMock()
-    #     mock_stream.is_selected.return_value = True
-    #     mock_stream.children = ["invoice_payments", "invoice_line_items"]
-    #     mock_stream.child_to_sync = []
-
-    #     client = MagicMock()
-    #     catalog = MagicMock()
-    #     catalog.get_stream.return_value = MagicMock()
-
-    #     write_schema(mock_stream, client, ["invoice_payments"], catalog)
-
-    #     mock_stream.write_schema.assert_called_once()
-    #     self.assertEqual(len(mock_stream.child_to_sync), 1)
-
-    # def test_write_schema_child_selected(self):
-    #     mock_stream = MagicMock()
-    #     mock_stream.is_selected.return_value = False
-    #     mock_stream.children = ["invoice_payments", "invoice_line_items"]
-    #     mock_stream.child_to_sync = []
-
-    #     client = MagicMock()
-    #     catalog = MagicMock()
-    #     catalog.get_stream.return_value = MagicMock()
-
-    #     write_schema(mock_stream, client, ["invoice_payments", "invoice_line_items"], catalog)
-
-    #     self.assertEqual(mock_stream.write_schema.call_count, 0)
-    #     self.assertEqual(len(mock_stream.child_to_sync), 2)
 
     @patch("singer.write_schema")
     @patch("singer.get_currently_syncing")
