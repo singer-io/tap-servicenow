@@ -131,7 +131,7 @@ class DynamicServiceNowTableStream(IncrementalStream):
             # Add as per need
         }
 
-        return mapping.get(snow_type.lower(), ["string", "null"])
+        return mapping.get(snow_type.lower(), {"type": ["string", "null"]})
 
 
 def get_all_tables(client, page_size=100, max_tables: int = None) -> List[str]:
