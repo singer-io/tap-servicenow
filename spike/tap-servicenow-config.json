@@ -1,0 +1,25 @@
+{
+  "tap_name": "ServiceNow",
+  "required_config_keys": ["instance", "user", "password"],
+  "page_size": 100,
+  "pagination_key": "sysparm_offset",
+  "next_page_strategy": "increment_by_results_count",
+  "headers": {
+    "Accept": "application/json",
+    "Content-Type": "application/json"
+  },
+  "auth_type": "basic",
+  "auth_config_keys": {
+    "instance": "instance",
+    "user": "user",
+    "password": "password"
+  },
+  "base_url": "https://{instance}.service-now.com/api/now/",
+  "streams": [],
+  "author": "Stitch",
+  "third_party_dependencies": [
+    "singer-python==6.1.1",
+    "requests==2.32.4",
+    "backoff==2.2.1"
+  ]
+}
