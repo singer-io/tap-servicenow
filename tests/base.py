@@ -33,10 +33,10 @@ class ServiceNowBaseTest(BaseCase):
     def expected_metadata(cls):
         """The expected streams and metadata about the streams."""
         return {
-            "sys_db_object": {
+            "cmdb_ci_vpc": {
                 cls.PRIMARY_KEYS: { "sys_id" },
-                cls.REPLICATION_METHOD: cls.FULL_TABLE,
-                cls.REPLICATION_KEYS: set(),
+                cls.REPLICATION_METHOD: cls.INCREMENTAL,
+                cls.REPLICATION_KEYS: set("sys_updated_on"),
                 cls.OBEYS_START_DATE: False,
                 cls.API_LIMIT: 100
             }
@@ -46,7 +46,11 @@ class ServiceNowBaseTest(BaseCase):
     def get_credentials():
         """Authentication information for the test account."""
         credentials_dict = {}
-        creds = 
+        creds = {
+            "instance": "TAP_SERVICENOW_INSTANCE",
+            "user": "TAP_SERVICENOW_USER",
+            "password": "TAP_SERVICENOW_PASSWORD",
+        }
 
         for cred in creds:
             credentials_dict[cred] = os.getenv(creds[cred])

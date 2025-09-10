@@ -3,7 +3,7 @@ from base import ServiceNowBaseTest
 from tap_tester.base_suite_tests.interrupted_sync_test import InterruptedSyncTest
 
 
-class ServiceNowInterruptedSyncTest(ServiceNowBaseTest):
+class ServiceNowInterruptedSyncTest(InterruptedSyncTest, ServiceNowBaseTest):
     """Test tap sets a bookmark and respects it for the next sync of a
     stream."""
 
