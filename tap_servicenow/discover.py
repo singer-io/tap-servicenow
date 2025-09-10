@@ -25,6 +25,7 @@ def discover(client) -> Catalog:
         md = metadata.write(md, (), 'replication-method', stream.replication_method)
         md = metadata.write(md, (), 'forced-replication-method', stream.replication_method)
         md = metadata.write(md, (), 'inclusion', 'automatic')
+        md = metadata.write(md, (), 'selected', 'true')
 
         for field_name in stream.schema_dict.get("properties", {}):
             md = metadata.write(md, ("properties", field_name), "inclusion", "automatic")

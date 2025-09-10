@@ -138,7 +138,6 @@ class Client:
             ServiceNowRateLimitError,
         ),
         max_tries=5,
-        factor=2,
     )
     def __make_request(
         self, method: str, endpoint: str, **kwargs

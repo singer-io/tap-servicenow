@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Any
 from tap_servicenow.streams.abstracts import IncrementalStream
 from singer import metadata, get_logger
 from singer.schema import Schema
@@ -110,7 +110,7 @@ class DynamicServiceNowTableStream(IncrementalStream):
             raise
 
     @staticmethod
-    def servicenow_type_to_json_type(snow_type: str) -> List[str]:
+    def servicenow_type_to_json_type(snow_type: str) -> Dict[str, Any]:
         """
         Map ServiceNow field types to JSON Schema types.
         """
