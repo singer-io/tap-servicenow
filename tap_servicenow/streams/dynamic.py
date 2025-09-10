@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Union
 from tap_servicenow.streams.abstracts import IncrementalStream
 from singer import metadata, get_logger
 from singer.schema import Schema
@@ -23,6 +23,7 @@ class DynamicServiceNowTableStream(IncrementalStream):
     @property
     def schema(self) -> Schema:
         return self._dynamic_schema
+
     @schema.setter
     def schema(self, value: Dict) -> None:
         self._dynamic_schema = Schema(value)
@@ -35,7 +36,7 @@ class DynamicServiceNowTableStream(IncrementalStream):
             if "properties" in inner:
                 return {"properties": inner["properties"]}
         return full_schema
-    
+
     @property
     def tap_stream_id(self) -> str:
         return self.table_name
@@ -110,7 +111,7 @@ class DynamicServiceNowTableStream(IncrementalStream):
             raise
 
     @staticmethod
-    def servicenow_type_to_json_type(snow_type: str) -> Dict[str, Any]:
+    def servicenow_type_to_json_type(snow_type: str) -> Dict[str, Union[str, List[str]]]:
         """
         Map ServiceNow field types to JSON Schema types.
         """
