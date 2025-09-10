@@ -39,7 +39,7 @@ class ServiceNowUnprocessableEntityError(ServiceNowBackoffError):
 class ServiceNowRateLimitError(ServiceNowBackoffError):
     """class representing 429 status code."""
     def __init__(self, message=None, response=None):
-        """Initialize the Amazon_AdsRateLimitError. Parses the 'Retry-After' header from the response (if present) and sets the
+        """Initialize the ServiceNowRateLimitError. Parses the 'Retry-After' header from the response (if present) and sets the
             `retry_after` attribute accordingly.
         """
         self.response = response
