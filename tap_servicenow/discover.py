@@ -35,6 +35,7 @@ def discover(client) -> Catalog:
                 tap_stream_id=stream_name,
                 key_properties=key_properties,
                 schema=schema,
+                replication_key='sys_updated_on',
                 metadata=mdata,
             )
         )

@@ -150,10 +150,9 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
 
             # Mark sys_updated_on as automatic
             mdata = metadata.to_map(mdata)
-            if "sys_updated_on" in properties:
-                mdata = metadata.write(
-                    mdata, ("properties", "sys_updated_on"), "inclusion", "automatic"
-                )
+            mdata = metadata.write(
+                mdata, ("properties", "sys_updated_on"), "inclusion", "automatic"
+            )
 
             # Add to field metadata
             field_metadata[table] = metadata.to_list(mdata)
