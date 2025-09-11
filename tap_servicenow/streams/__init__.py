@@ -6,7 +6,7 @@ LOGGER = get_logger()
 STREAMS= {}
 
 
-def get_all_tables(client, page_size=100, max_tables: int = 1) -> List[str]:
+def get_all_tables(client, page_size=100, max_tables: int = None) -> List[str]:
     """
     Paginate through sys_db_object to get up to `max_tables` table names.
     If `max_tables` is None, it fetches all tables (production mode).
