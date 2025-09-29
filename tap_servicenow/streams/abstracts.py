@@ -31,7 +31,8 @@ class BaseStream(ABC):
 
     url_endpoint = ""
     path = ""
-    page_size = 100
+    page_size = 1000
+    offset = 0
     next_page_key = ""
     headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
     children = []
@@ -105,18 +106,11 @@ class BaseStream(ABC):
 
     def get_records(self) -> Iterator:
         """Interacts with API client with pagination and rate limiting."""
-        offset = 0
-        page_size = self.page_size or 100
+        page_size = self.page_size or 1000
         has_more = True
 
         while has_more:
             try:
-                # Set pagination parameters
-                self.params.update({
-                    "sysparm_offset": offset,
-                    "sysparm_limit": page_size
-                })
-
                 response = self.client.make_request(
                     self.http_method,
                     self.url_endpoint,
@@ -218,7 +212,7 @@ class IncrementalStream(BaseStream):
         """Implementation for `type: Incremental` stream."""
         bookmark_date = self.get_bookmark(state, self.tap_stream_id)
         current_max_bookmark_date = bookmark_date
-        self.update_params(updated_since=bookmark_date)
+        self.update_params(sys_updated_on=bookmark_date, sysparm_limit=self.page_size, sysparm_offset=self.offset)
         if parent_obj:
             self.update_data_payload(**parent_obj)
 

@@ -86,8 +86,19 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
     schemas = {}
     field_metadata = {}
 
+    def mark_stream_unsupported(field_metadata: Dict, table: str):
+        mdata = metadata.get_standard_metadata(
+            schema={"type": "object", "properties": {}},
+            key_properties=[],
+            valid_replication_keys=[],
+            replication_method=None
+        )
+        mdata = metadata.to_map(mdata)
+        mdata[()]["inclusion"] = "unsupported"
+        field_metadata[table] = metadata.to_list(mdata)
+
     # Step 1: Get all table names from sys_db_object
-    table_names = get_all_tables(client)  # make sure you defined this helper already
+    table_names = get_all_tables(client)
 
     for table in table_names:
         try:
@@ -116,7 +127,6 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
                 name = field.get("element")
                 snow_type = field.get("internal_type")
 
-                # Unwrap if needed
                 if isinstance(snow_type, dict):
                     snow_type = snow_type.get("value")
 
@@ -129,6 +139,10 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
             # Ensure sys_id is included
             if "sys_id" not in properties:
                 properties["sys_id"] = {"type": ["string", "null"]}
+                
+            if "sys_updated_on" not in properties:
+                properties["sys_updated_on"] = {"type": ["string", "null"], "format": "date-time"}
+
 
             # Create schema dict
             schema = {
@@ -136,29 +150,47 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
                 "properties": properties
             }
 
-            # Add to schemas
             schemas[table] = schema
 
-            # Create singer metadata
-            mdata = metadata.new()
+            # Step 3: Validate data access by fetching sample records
+            try:
+                data_response = client.make_request(
+                    method="GET",
+                    endpoint=f"{client.base_url}/{table}",
+                    params={"sysparm_limit": 1}
+                )
+
+                records = data_response.get("result", [])
+                if len(records) == 1 and records[0] == {}:
+                    LOGGER.warning(f"Table {table} returned nodata — user unauthorized. Marking as unsupported.")
+                    mark_stream_unsupported(field_metadata, table)
+                    continue
+
+            except Exception as e:
+                LOGGER.warning(f"Error accessing data from table {table}: {str(e)}. Marking as unsupported.")
+                mark_stream_unsupported(field_metadata, table)
+                continue
+
+            # Step 4: Create singer metadata
             mdata = metadata.get_standard_metadata(
                 schema=schema,
                 key_properties=["sys_id"],
                 valid_replication_keys=["sys_updated_on"],
                 replication_method="INCREMENTAL"
             )
+            mdata = metadata.to_map(mdata)
 
             # Mark sys_updated_on as automatic
-            mdata = metadata.to_map(mdata)
-            mdata = metadata.write(
-                mdata, ("properties", "sys_updated_on"), "inclusion", "automatic"
-            )
+            if "sys_updated_on" in properties:
+                mdata = metadata.write(
+                    mdata, ("properties", "sys_updated_on"), "inclusion", "automatic"
+                )
 
-            # Add to field metadata
             field_metadata[table] = metadata.to_list(mdata)
 
         except Exception as e:
             LOGGER.error(f"Failed to fetch schema for table {table}: {str(e)}")
+            mark_stream_unsupported(field_metadata, table)
             continue
 
     return schemas, field_metadata
