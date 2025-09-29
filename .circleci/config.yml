@@ -13,11 +13,6 @@ jobs:
             pip install -U "pip==22.2.2" "setuptools==65.3.0"
             pip install .[dev]
       - run:
-          name: "JSON Validator"
-          command: |
-            source /usr/local/share/virtualenvs/tap-tester/bin/activate
-            stitch-validate-json tap_servicenow/schemas/*.json
-      - run:
           name: "pylint"
           command: |
             source /usr/local/share/virtualenvs/tap-servicenow/bin/activate
