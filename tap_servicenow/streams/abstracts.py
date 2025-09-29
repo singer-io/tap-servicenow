@@ -325,7 +325,7 @@ class ChildBaseStream(IncrementalStream):
     def get_bookmark(self, state: Dict, stream: str, key: Any = None) -> int:
         """Singleton bookmark value for child streams."""
         if not self.bookmark_value:
-            self.bookmark_value = super().get_bookmark(state, stream)
+            self.bookmark_value = super().get_bookmark(state, stream)  # pylint: disable=access-member-before-definition
 
         return self.bookmark_value
 
