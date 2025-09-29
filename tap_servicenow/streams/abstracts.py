@@ -32,7 +32,6 @@ class BaseStream(ABC):
     url_endpoint = ""
     path = ""
     page_size = 1000
-    offset = 0
     next_page_key = ""
     headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
     children = []
@@ -106,9 +105,9 @@ class BaseStream(ABC):
 
     def get_records(self) -> Iterator:
         """Interacts with API client with pagination and rate limiting."""
+        offset = 0
         page_size = self.page_size or 1000
         has_more = True
-
         while has_more:
             try:
                 response = self.client.make_request(
@@ -126,9 +125,6 @@ class BaseStream(ABC):
                     has_more = False
                 else:
                     offset += page_size
-
-                if hasattr(self, "rate_limit_sleep") and self.rate_limit_sleep:
-                    time.sleep(self.rate_limit_sleep)
 
             except ServiceNowForbiddenError as e:
                 LOGGER.critical(f"403 Forbidden on {self.url_endpoint}: {e}")
@@ -212,7 +208,7 @@ class IncrementalStream(BaseStream):
         """Implementation for `type: Incremental` stream."""
         bookmark_date = self.get_bookmark(state, self.tap_stream_id)
         current_max_bookmark_date = bookmark_date
-        self.update_params(sys_updated_on=bookmark_date, sysparm_limit=self.page_size, sysparm_offset=self.offset)
+        self.update_params(sys_updated_on=bookmark_date, sysparm_limit=self.page_size)
         if parent_obj:
             self.update_data_payload(**parent_obj)
 
