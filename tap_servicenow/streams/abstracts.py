@@ -313,19 +313,3 @@ class ParentBaseStream(IncrementalStream):
             )
 
         return state
-
-
-class ChildBaseStream(IncrementalStream):
-    """Base Class for Child Stream."""
-
-    def get_url_endpoint(self, parent_obj=None):
-        """Prepare URL endpoint for child streams."""
-        return f"{self.client.base_url}/{self.path.format(parent_obj['id'])}"
-
-    def get_bookmark(self, state: Dict, stream: str, key: Any = None) -> int:
-        """Singleton bookmark value for child streams."""
-        if not self.bookmark_value:
-            self.bookmark_value = super().get_bookmark(state, stream)  # pylint: disable=access-member-before-definition
-
-        return self.bookmark_value
-
