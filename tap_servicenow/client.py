@@ -78,6 +78,20 @@ class Client:
             self.config["password"]
         )
         return headers, params
+    
+    def get(
+        self,
+        table: str,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, Any]] = None
+    ) -> Any:
+        params = params or {}
+        headers = headers or {}
+        headers, params = self.authenticate(headers, params)
+        url = f"{self.base_url}/{table}"
+        response = self._session.get(url, headers=headers, params=params, timeout=self.request_timeout)
+
+        return response.status_code
 
     def make_request(
         self,

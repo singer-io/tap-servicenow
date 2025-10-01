@@ -31,7 +31,7 @@ class BaseStream(ABC):
 
     url_endpoint = ""
     path = ""
-    page_size = 1000
+    page_size = 5000
     next_page_key = ""
     headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
     children = []
@@ -110,10 +110,12 @@ class BaseStream(ABC):
         has_more = True
         while has_more:
             try:
+                paginated_params = self.params.copy()
+                paginated_params["sysparm_offset"] = offset
                 response = self.client.make_request(
                     self.http_method,
                     self.url_endpoint,
-                    self.params,
+                    paginated_params,
                     self.headers,
                     body=json.dumps(self.data_payload),
                     path=self.path
@@ -208,7 +210,8 @@ class IncrementalStream(BaseStream):
         """Implementation for `type: Incremental` stream."""
         bookmark_date = self.get_bookmark(state, self.tap_stream_id)
         current_max_bookmark_date = bookmark_date
-        self.update_params(sys_updated_on=bookmark_date, sysparm_limit=self.page_size)
+        bookmark_param = f"sys_updated_on>={bookmark_date}"
+        self.update_params(sysparm_query=bookmark_param, sysparm_limit=self.page_size)
         if parent_obj:
             self.update_data_payload(**parent_obj)
 
@@ -216,7 +219,11 @@ class IncrementalStream(BaseStream):
 
         with metrics.record_counter(self.tap_stream_id) as counter:
             try:
+                empty_record_count = 0
                 for record in self.get_records():
+                    if isinstance(record, dict) and not record:
+                        empty_record_count += 1
+                        continue
                     record = self.modify_object(record, parent_obj)
                     transformed_record = transformer.transform(
                         record, self.schema, self.metadata
@@ -240,6 +247,10 @@ class IncrementalStream(BaseStream):
                             child.sync(state=state, transformer=transformer, parent_obj=record)
                             
                 state = self.write_bookmark(state, self.tap_stream_id, value=current_max_bookmark_date)
+                if empty_record_count > 0:
+                    LOGGER.warning(
+                        f"Stream '{self.tap_stream_id}' encountered {empty_record_count} empty records (possibly due to missing data level permissions)."
+                    )
                 return counter.value
 
             except Exception as e:

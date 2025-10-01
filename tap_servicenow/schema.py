@@ -90,17 +90,6 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
     schemas = {}
     field_metadata = {}
 
-    def mark_stream_unsupported(field_metadata: Dict, table: str):
-        mdata = metadata.get_standard_metadata(
-            schema={"type": "object", "properties": {}},
-            key_properties=[],
-            valid_replication_keys=[],
-            replication_method=None
-        )
-        mdata = metadata.to_map(mdata)
-        mdata[()]["inclusion"] = "unsupported"
-        field_metadata[table] = metadata.to_list(mdata)
-
     # Step 1: Get all table names from sys_db_object
     table_names = get_all_tables(client)
 
@@ -156,23 +145,17 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
 
             schemas[table] = schema
 
-            # Step 3: Validate data access by fetching sample records
             try:
-                data_response = client.make_request(
-                    method="GET",
-                    endpoint=f"{client.base_url}/{table}",
+                status_code = client.get(
+                    table=table,
                     params={"sysparm_limit": 1}
                 )
 
-                records = data_response.get("result", [])
-                if len(records) == 1 and records[0] == {}:
-                    LOGGER.warning(f"Table {table} returned nodata — user unauthorized. Marking as unsupported.")
-                    mark_stream_unsupported(field_metadata, table)
-                    continue
+                if status_code in (401, 403):
+                    LOGGER.warning(f"Cannot access table '{table}'. Please check your credentials and permissions.")
 
             except Exception as e:
-                LOGGER.warning(f"Error accessing data from table {table}: {str(e)}. Marking as unsupported.")
-                mark_stream_unsupported(field_metadata, table)
+                LOGGER.warning(f"Error accessing data from table {table}: {str(e)}")
                 continue
 
             # Step 4: Create singer metadata
@@ -194,7 +177,6 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
 
         except Exception as e:
             LOGGER.error(f"Failed to fetch schema for table {table}: {str(e)}")
-            mark_stream_unsupported(field_metadata, table)
             continue
 
     return schemas, field_metadata
