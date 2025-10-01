@@ -89,6 +89,7 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
     LOGGER.info("Fetching dynamic schema from ServiceNow.")
     schemas = {}
     field_metadata = {}
+    unauthorized_tables = []
 
     # Step 1: Get all table names from sys_db_object
     table_names = get_all_tables(client)
@@ -143,20 +144,20 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
                 "properties": properties
             }
 
-            schemas[table] = schema
-
             try:
                 status_code = client.get(
                     table=table,
                     params={"sysparm_limit": 1}
                 )
-
                 if status_code in (401, 403):
-                    LOGGER.warning(f"Cannot access table '{table}'. Please check your credentials and permissions.")
+                    unauthorized_tables.append(table)
+                    continue
 
             except Exception as e:
                 LOGGER.warning(f"Error accessing data from table {table}: {str(e)}")
                 continue
+
+            schemas[table] = schema
 
             # Step 4: Create singer metadata
             mdata = metadata.get_standard_metadata(
@@ -178,5 +179,21 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
         except Exception as e:
             LOGGER.error(f"Failed to fetch schema for table {table}: {str(e)}")
             continue
+
+    if unauthorized_tables:
+        total = len(table_names)
+        blocked = len(unauthorized_tables)
+        tables_str = ", ".join(unauthorized_tables)
+
+        if blocked != total:
+            LOGGER.warning(
+                f"The account credentials do not have access to {blocked} table(s): {tables_str}. "
+                f"These tables were skipped due to insufficient permissions."
+            )
+        else:
+            raise Exception(
+                "HTTP-error-code: 403. The account does not have 'read' access to any of the ServiceNow tables. "
+                "Data discovery cannot proceed."
+            )
 
     return schemas, field_metadata

@@ -42,7 +42,6 @@ def get_all_tables(client, page_size=100, max_tables: int = None) -> List[str]:
             seen.add(name)
 
         offset += len(records)
-    LOGGER.info('sdhajfkhd %s', all_tables)
     return all_tables
 
 
