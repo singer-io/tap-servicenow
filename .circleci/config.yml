@@ -1,0 +1,34 @@
+version: 2.1
+jobs:
+  build:
+    docker:
+      - image: 218546966473.dkr.ecr.us-east-1.amazonaws.com/circle-ci:stitch-tap-tester-uv
+    steps:
+      - checkout
+      - run:
+          name: 'Setup virtual env'
+          command: |
+            uv venv --python 3.12 /usr/local/share/virtualenvs/tap-servicenow
+            source /usr/local/share/virtualenvs/tap-servicenow/bin/activate
+            uv pip install -U 'pip==22.2.2' 'setuptools==65.3.0'
+            uv pip install .[dev]
+      - add_ssh_keys
+
+
+workflows:
+  version: 2
+  commit:
+    jobs:
+      - build:
+          context: circleci-user
+  build_daily:
+    triggers:
+      - schedule:
+          cron: "0 19 * * *"
+          filters:
+            branches:
+              only:
+                - master
+    jobs:
+      - build:
+          context: circleci-user

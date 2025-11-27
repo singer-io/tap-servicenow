@@ -1,0 +1,11 @@
+{
+    "type": "object",
+    "properties": {
+        "key_value": {
+            "type": [
+                "null",
+                "string"
+            ]
+        }
+    }
+}
