@@ -1,48 +1,117 @@
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 from singer import get_logger
 
 LOGGER = get_logger()
 
-STREAMS= {}
+STREAMS = {}
+
+# Tables excluded from sync by default due to high row counts, high write
+# velocity, or because they are queried via a dedicated mechanism (e.g.
+# sys_audit_delete for delete detection).  Operators may override these via
+# the "include_tables" / "exclude_tables" config keys.
+DEFAULT_EXCLUDED_TABLES: frozenset = frozenset({
+    "sys_audit",            # millions of rows; Fivetran explicitly blocks this
+    "sys_audit_delete",     # queried separately for delete detection; not a data table
+    "syslog",               # transaction logs; millions of rows, high write velocity
+    "syslog_transaction",   # per-transaction performance logs
+    "sys_email_log",        # email delivery logs; high volume on active instances
+    "sys_history_line",     # field-level change history; row count proportional to all field changes
+    "sys_history_set",      # change-set groupings for sys_history_line
+    "ha_log",               # high-availability cluster logs
+    "sys_cache_flush",      # cache management events
+    "sys_cluster_state",    # cluster node state
+})
 
 
-def get_all_tables(client, page_size=100, max_tables: int = None) -> List[str]:
+def get_all_tables(client, page_size: int = 500) -> Dict[str, str]:
     """
-    Paginate through sys_db_object to get up to `max_tables` table names.
-    If `max_tables` is None, it fetches all tables (production mode).
+    Enumerate **all** tables from sys_db_object using keyset pagination
+    (sys_id-based, avoids offset degradation on large result sets).
+
+    Returns a dict of ``{table_name: super_class_name}`` for every table
+    present in the instance.  No filtering is applied here so that the
+    full map can be used for table-inheritance resolution in schema
+    discovery.  Call :func:`get_sync_tables` to apply the exclusion list.
+
+    Dot-walking ``super_class.name`` in sysparm_fields returns the
+    referenced table's name as a flat string, which is what we need for
+    walking the inheritance chain.
     """
-    all_tables = []
-    offset = 0
-    seen = set()
+    table_map: Dict[str, str] = {}
+    last_sys_id: str = ""
 
     while True:
+        if last_sys_id:
+            query = f"sys_id>{last_sys_id}^ORDERBYsys_id"
+        else:
+            query = "ORDERBYsys_id"
+
         params = {
-            "sysparm_offset": offset,
-            "sysparm_limit": page_size
+            "sysparm_query": query,
+            "sysparm_fields": "name,sys_id,super_class.name",
+            "sysparm_limit": page_size,
+            "sysparm_no_count": "true",
+            "sysparm_exclude_reference_link": "true",
         }
 
         response = client.make_request(
             method="GET",
             endpoint=f"{client.base_url}/sys_db_object",
-            params=params
+            params=params,
         )
 
         records = response.get("result", [])
         if not records:
             break
 
-        new_names = [r["name"] for r in records if "name" in r and r["name"] not in seen]
-        if not new_names:
+        for r in records:
+            name = r.get("name") or ""
+            # dot-walked field arrives as a plain string or nested dict
+            super_raw = r.get("super_class.name") or r.get("super_class") or ""
+            if isinstance(super_raw, dict):
+                super_raw = super_raw.get("display_value") or super_raw.get("value") or ""
+            sys_id = r.get("sys_id") or ""
+
+            if name:
+                table_map[name] = super_raw
+            if sys_id:
+                last_sys_id = sys_id
+
+        if len(records) < page_size:
             break
 
-        for name in new_names:
-            if max_tables is not None and len(all_tables) >= max_tables:
-                return all_tables
-            all_tables.append(name)
-            seen.add(name)
+    return table_map
 
-        offset += len(records)
-    return all_tables
+
+def get_sync_tables(
+    table_map: Dict[str, str],
+    config: Optional[Dict] = None,
+) -> List[str]:
+    """
+    Apply the default exclusion list plus any operator-supplied
+    ``include_tables`` / ``exclude_tables`` config overrides to
+    ``table_map`` and return the ordered list of table names to sync.
+
+    ``include_tables`` (if non-empty) acts as an allowlist — only those
+    tables are synced.  ``exclude_tables`` is additive to the default
+    exclusion list.
+    """
+    config = config or {}
+
+    excluded: set = set(DEFAULT_EXCLUDED_TABLES)
+    excluded.update(config.get("exclude_tables", []))
+
+    include_only: set = set(config.get("include_tables", []))
+
+    result: List[str] = []
+    for name in table_map:
+        if name in excluded:
+            continue
+        if include_only and name not in include_only:
+            continue
+        result.append(name)
+
+    return result
 
 
 def servicenow_type_to_json_type(snow_type: str) -> Dict[str, Union[str, List[str]]]:

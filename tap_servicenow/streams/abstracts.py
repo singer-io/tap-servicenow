@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 import json
 from typing import Any, Dict, Tuple, List, Iterator
+import singer
 from singer import (
     Transformer,
     get_bookmark,
@@ -31,7 +32,9 @@ class BaseStream(ABC):
 
     url_endpoint = ""
     path = ""
-    page_size = 5000
+    # Page size between 500-2000 per ServiceNow community best practice.
+    # 5000 was the root-cause of the Oct-2025 REST transaction quota breach.
+    page_size = 1000
     next_page_key = ""
     headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
     children = []
@@ -104,29 +107,72 @@ class BaseStream(ABC):
         """
 
     def get_records(self) -> Iterator:
-        """Interacts with API client with pagination and rate limiting."""
-        offset = 0
+        """
+        Fetch records using **keyset pagination** (sys_id-based) instead of
+        offset-based pagination.  Offset pagination degrades linearly because
+        the database must re-scan and discard all preceding rows; keyset
+        pagination stays O(1) per page regardless of position.
+
+        Every request includes the three ServiceNow performance params:
+        - sysparm_no_count=true    – skips the expensive COUNT query
+        - sysparm_exclude_reference_link=true – trims payload size
+        - sysparm_fields           – fetches only schema-selected columns
+
+        Used primarily by FullTableStream.  IncrementalStream.sync() has its
+        own inline loop that combines the compound watermark with keyset
+        pagination into a single cursor.
+        """
         page_size = self.page_size or 1000
-        has_more = True
-        while has_more:
+        last_sys_id: str = ""
+
+        # Build field selection from the schema defined on this stream
+        fields: str = ",".join(self.schema.get("properties", {}).keys()) or ""
+
+        while True:
             try:
                 paginated_params = self.params.copy()
-                paginated_params["sysparm_offset"] = offset
+
+                # Keyset clause appended to whatever base query was set externally
+                base_query = paginated_params.get("sysparm_query", "")
+                if last_sys_id:
+                    keyset = f"sys_id>{last_sys_id}"
+                    paginated_params["sysparm_query"] = (
+                        f"{base_query}^{keyset}^ORDERBYsys_id"
+                        if base_query
+                        else f"{keyset}^ORDERBYsys_id"
+                    )
+                else:
+                    paginated_params["sysparm_query"] = (
+                        f"{base_query}^ORDERBYsys_id" if base_query else "ORDERBYsys_id"
+                    )
+
+                # Remove offset key if it was added by legacy code
+                paginated_params.pop("sysparm_offset", None)
+
+                # Performance params
+                paginated_params["sysparm_limit"] = page_size
+                paginated_params["sysparm_no_count"] = "true"
+                paginated_params["sysparm_exclude_reference_link"] = "true"
+                if fields:
+                    paginated_params["sysparm_fields"] = fields
+
                 response = self.client.make_request(
                     self.http_method,
                     self.url_endpoint,
                     paginated_params,
                     self.headers,
                     body=json.dumps(self.data_payload),
-                    path=self.path
+                    path=self.path,
                 )
                 raw_records = response.get(self.data_key, [])
-                yield from raw_records
+
+                for record in raw_records:
+                    if record:  # skip empty {} records
+                        last_sys_id = record.get("sys_id", last_sys_id)
+                        yield record
 
                 if len(raw_records) < page_size:
-                    has_more = False
-                else:
-                    offset += page_size
+                    break
 
             except ServiceNowForbiddenError as e:
                 LOGGER.critical(f"403 Forbidden on {self.url_endpoint}: {e}")
@@ -207,54 +253,142 @@ class IncrementalStream(BaseStream):
         transformer: Transformer,
         parent_obj: Dict = None,
     ) -> Dict:
-        """Implementation for `type: Incremental` stream."""
-        bookmark_date = self.get_bookmark(state, self.tap_stream_id)
-        current_max_bookmark_date = bookmark_date
-        bookmark_param = f"sys_updated_on>={bookmark_date}"
-        self.update_params(sysparm_query=bookmark_param, sysparm_limit=self.page_size)
+        """
+        Incremental sync using a **compound watermark** (sys_updated_on +
+        sys_id) combined with keyset pagination in a single unified cursor.
+
+        Single-field watermarks on sys_updated_on alone can miss records
+        that share the same timestamp second (documented as the
+        "Timestamp Problem" by Boris Moers / ServiceNow community).  The
+        compound pattern fixes this:
+
+            (sys_updated_on > last_dt)
+            OR (sys_updated_on = last_dt AND sys_id > last_sid)
+
+        sorted by both fields, so the last row of each page becomes the
+        next page's cursor *and* the persisted bookmark simultaneously.
+        """
+        replication_key = self.replication_keys[0] if self.replication_keys else "sys_updated_on"
+
+        # --- Retrieve compound bookmark -----------------------------------
+        bookmark_dt: str = self.get_bookmark(state, self.tap_stream_id)
+        bookmark_sid: str = get_bookmark(state, self.tap_stream_id, "sys_id_bookmark", "")
+
+        current_max_dt: str = bookmark_dt
+        current_max_sid: str = bookmark_sid
+        # Keyset cursor advances with every page; starts at the bookmark.
+        last_page_sid: str = bookmark_sid
+
+        page_size: int = self.page_size or 1000
+        self.url_endpoint = self.get_url_endpoint(parent_obj)
         if parent_obj:
             self.update_data_payload(**parent_obj)
 
-        self.url_endpoint = self.get_url_endpoint(parent_obj)
+        # Field selection derived from the stream's schema
+        fields: str = ",".join(self.schema.get("properties", {}).keys()) or ""
 
         with metrics.record_counter(self.tap_stream_id) as counter:
+            empty_record_count = 0
             try:
-                empty_record_count = 0
-                for record in self.get_records():
-                    if isinstance(record, dict) and not record:
-                        empty_record_count += 1
-                        continue
-                    record = self.modify_object(record, parent_obj)
-                    transformed_record = transformer.transform(
-                        record, self.schema, self.metadata
-                    )
-
-                    if self.replication_keys and transformed_record.get(self.replication_keys[0]):
-                        record_bookmark = transformed_record.get(self.replication_keys[0])
+                while True:
+                    # Build compound watermark + keyset query
+                    if last_page_sid:
+                        # Records strictly after the last seen position
+                        query = (
+                            f"{replication_key}>{bookmark_dt}"
+                            f"^OR{replication_key}={bookmark_dt}^sys_id>{last_page_sid}"
+                            f"^ORDERBY{replication_key}^ORDERBYsys_id"
+                        )
                     else:
-                        record_bookmark = bookmark_date
-
-                    if record_bookmark >= bookmark_date:
-                        if self.is_selected():
-                            write_record(self.tap_stream_id, transformed_record)
-                            counter.increment()
-
-                        current_max_bookmark_date = max(
-                            current_max_bookmark_date, record_bookmark
+                        # First page of a fresh sync — use >= to include bookmark row
+                        query = (
+                            f"{replication_key}>={bookmark_dt}"
+                            f"^ORDERBY{replication_key}^ORDERBYsys_id"
                         )
 
-                        for child in self.child_to_sync:
-                            child.sync(state=state, transformer=transformer, parent_obj=record)
-                            
-                state = self.write_bookmark(state, self.tap_stream_id, value=current_max_bookmark_date)
+                    params: Dict = {
+                        "sysparm_query": query,
+                        "sysparm_limit": page_size,
+                        "sysparm_no_count": "true",
+                        "sysparm_exclude_reference_link": "true",
+                    }
+                    if fields:
+                        params["sysparm_fields"] = fields
+
+                    try:
+                        response = self.client.make_request(
+                            self.http_method,
+                            self.url_endpoint,
+                            params,
+                            self.headers,
+                            body=json.dumps(self.data_payload),
+                            path=self.path,
+                        )
+                    except ServiceNowForbiddenError as e:
+                        LOGGER.critical(f"403 Forbidden on {self.url_endpoint}: {e}")
+                        break
+
+                    raw_records = response.get(self.data_key, [])
+                    if not raw_records:
+                        break
+
+                    for record in raw_records:
+                        if isinstance(record, dict) and not record:
+                            empty_record_count += 1
+                            continue
+
+                        record = self.modify_object(record, parent_obj)
+
+                        record_dt: str = record.get(replication_key) or bookmark_dt
+                        record_sid: str = record.get("sys_id", "")
+
+                        # Advance compound cursor (both fields must move forward)
+                        if record_dt > current_max_dt or (
+                            record_dt == current_max_dt and record_sid > current_max_sid
+                        ):
+                            current_max_dt = record_dt
+                            current_max_sid = record_sid
+
+                        # Advance the keyset page cursor
+                        if record_sid:
+                            last_page_sid = record_sid
+
+                        if record_dt >= bookmark_dt:
+                            transformed_record = transformer.transform(
+                                record, self.schema, self.metadata
+                            )
+                            if self.is_selected():
+                                write_record(self.tap_stream_id, transformed_record)
+                                counter.increment()
+
+                            for child in self.child_to_sync:
+                                child.sync(
+                                    state=state,
+                                    transformer=transformer,
+                                    parent_obj=record,
+                                )
+
+                    if len(raw_records) < page_size:
+                        break
+
+                # --- Persist compound bookmark ----------------------------
+                state = write_bookmark(
+                    state, self.tap_stream_id, replication_key, current_max_dt
+                )
+                state = write_bookmark(
+                    state, self.tap_stream_id, "sys_id_bookmark", current_max_sid
+                )
+                singer.write_state(state)
+
                 if empty_record_count > 0:
                     LOGGER.warning(
-                        f"Stream '{self.tap_stream_id}' encountered {empty_record_count} empty records (possibly due to missing data level permissions)."
+                        f"Stream '{self.tap_stream_id}' encountered {empty_record_count} "
+                        f"empty records (possibly due to missing data-level permissions)."
                     )
                 return counter.value
 
             except Exception as e:
-                LOGGER.critical(f"Skipping stream '{self.tap_stream_id}' due to : {e}")
+                LOGGER.critical(f"Skipping stream '{self.tap_stream_id}' due to: {e}")
                 return 0
 
 
