@@ -315,12 +315,22 @@ class TestInheritanceResolution(unittest.TestCase):
         props = schemas.get("no_sys_id_table", {}).get("properties", {})
         self.assertIn("sys_id", props)
 
-    def test_sys_updated_on_always_in_schema(self):
+    def test_sys_updated_on_absent_means_full_table(self):
+        """A table with no sys_updated_on in sys_dictionary must be treated as
+        FULL_TABLE.  The field must NOT be injected into the schema."""
+        from singer import metadata
         table_map = {"no_dt_table": ""}
         fields_by_table = {"no_dt_table": ["some_field"]}
-        schemas, _ = self._run(table_map, ["no_dt_table"], fields_by_table)
+        schemas, field_metadata = self._run(table_map, ["no_dt_table"], fields_by_table)
         props = schemas.get("no_dt_table", {}).get("properties", {})
-        self.assertIn("sys_updated_on", props)
+        self.assertNotIn("sys_updated_on", props)
+        # Metadata must declare FULL_TABLE replication
+        mdata = metadata.to_map(field_metadata.get("no_dt_table", []))
+        self.assertEqual(
+            metadata.get(mdata, (), "forced-replication-method") or
+            metadata.get(mdata, (), "replication-method"),
+            "FULL_TABLE",
+        )
 
 
 # ---------------------------------------------------------------------------
