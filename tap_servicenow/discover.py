@@ -28,6 +28,12 @@ def discover(client) -> Catalog:
             raise err
 
         key_properties = metadata.to_map(mdata).get((), {}).get("table-key-properties")
+        root_meta = metadata.to_map(mdata).get((), {})
+        rep_method = (
+            root_meta.get("forced-replication-method")
+            or root_meta.get("replication-method")
+        )
+        rep_key = "sys_updated_on" if rep_method == "INCREMENTAL" else None
 
         catalog.streams.append(
             CatalogEntry(
@@ -35,7 +41,7 @@ def discover(client) -> Catalog:
                 tap_stream_id=stream_name,
                 key_properties=key_properties,
                 schema=schema,
-                replication_key='sys_updated_on',
+                replication_key=rep_key,
                 metadata=mdata,
             )
         )

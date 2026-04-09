@@ -16,7 +16,7 @@ from singer import (
 import time
 from datetime import timezone
 import dateutil.parser
-from tap_servicenow.exceptions import ServiceNowForbiddenError
+from tap_servicenow.exceptions import ServiceNowError, ServiceNowForbiddenError
 
 
 def _to_snow_dt(value: str) -> str:
@@ -393,9 +393,12 @@ class IncrementalStream(BaseStream):
                     )
                 return counter.value
 
-            except Exception as e:
+            except ServiceNowError as e:
+                # A ServiceNow API error that exhausted retries or is non-retryable
+                # (e.g. 403 Forbidden). Log and skip this stream gracefully.
                 LOGGER.critical(f"Skipping stream '{self.tap_stream_id}' due to: {e}")
                 return 0
+            # All other exceptions (programming errors, KeyError, etc.) propagate
 
 
 class FullTableStream(BaseStream):

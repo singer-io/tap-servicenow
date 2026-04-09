@@ -74,6 +74,7 @@ class TestClient(unittest.TestCase):
         ["403 error", 403, MockResponse(403), ServiceNowForbiddenError, "You are missing the following required scopes: read"],
         ["404 error", 404, MockResponse(404), ServiceNowNotFoundError, "The resource you have specified cannot be found."],
         ["409 error", 409, MockResponse(409), ServiceNowConflictError, "The API request cannot be completed because the requested operation would conflict with an existing item."],
+        ["422 error", 422, MockResponse(422), ServiceNowUnprocessableEntityError, "The request content itself is not processable by the server."],
     ])
     def test_make_request_http_failure_without_retry(self, test_name, error_code, mock_response, error, error_message):
         
@@ -85,7 +86,6 @@ class TestClient(unittest.TestCase):
         self.assertEqual(str(e.exception), expected_error_message)
 
     @parameterized.expand([
-        ["422 error", 422, MockResponse(422), ServiceNowUnprocessableEntityError, "The request content itself is not processable by the server."],
         ["429 error", 429, MockResponse(429, headers={"Retry-After": "2"}), ServiceNowRateLimitError, "The API rate limit for your organisation/application pairing has been exceeded. (Retry after 2 seconds.)"],
         ["500 error", 500, MockResponse(500), ServiceNowInternalServerError, "The server encountered an unexpected condition which prevented it from fulfilling the request."],
         ["501 error", 501, MockResponse(501), ServiceNowNotImplementedError, "The server does not support the functionality required to fulfill the request."],

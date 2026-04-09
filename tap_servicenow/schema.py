@@ -5,6 +5,7 @@ from typing import Dict, Tuple
 from singer import metadata
 from tap_servicenow.streams import STREAMS
 from tap_servicenow.streams import get_all_tables, get_sync_tables, servicenow_type_to_json_type
+from tap_servicenow.exceptions import ServiceNowForbiddenError, ServiceNowUnauthorizedError
 
 LOGGER = singer.get_logger()
 
@@ -232,13 +233,13 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
 
             # Lightweight access check (1 record, no count)
             try:
-                status_code = client.get(
+                client.get(
                     table=table,
                     params={"sysparm_limit": 1, "sysparm_no_count": "true"},
                 )
-                if status_code in (401, 403):
-                    unauthorized_tables.append(table)
-                    continue
+            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError):
+                unauthorized_tables.append(table)
+                continue
             except Exception as exc:
                 LOGGER.warning(f"Error accessing table '{table}': {exc}")
                 continue

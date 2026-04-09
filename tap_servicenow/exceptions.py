@@ -32,8 +32,14 @@ class ServiceNowConflictError(ServiceNowError):
     """class representing 409 status code."""
     pass
 
-class ServiceNowUnprocessableEntityError(ServiceNowBackoffError):
-    """class representing 422 status code."""
+class ServiceNowUnprocessableEntityError(ServiceNowError):
+    """class representing 422 status code.
+
+    422 Unprocessable Entity means the request syntax was valid but the
+    content is semantically incorrect (e.g. a bad sysparm_query string).
+    Retrying the same request will always fail, so this must NOT inherit
+    from ServiceNowBackoffError.
+    """
     pass
 
 class ServiceNowRateLimitError(ServiceNowBackoffError):

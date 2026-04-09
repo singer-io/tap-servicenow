@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch, call
 
 from tap_servicenow.schema import get_dynamic_schema
 from tap_servicenow.streams import DEFAULT_EXCLUDED_TABLES
+from tap_servicenow.exceptions import ServiceNowForbiddenError, ServiceNowUnauthorizedError
 
 
 # ---------------------------------------------------------------------------
@@ -22,8 +23,8 @@ def _make_client(config=None):
     c = MagicMock()
     c.base_url = "https://test.service-now.com/api/now/table"
     c.config = config or {}
-    # Default: tables are accessible (status 200)
-    c.get.return_value = 200
+    # Default: tables are accessible — get() returns None (no exception)
+    c.get.return_value = None
     return c
 
 
@@ -355,7 +356,10 @@ class TestUnauthorisedTableHandling(unittest.TestCase):
         }
 
         def fake_get(table, params=None):
-            return 403 if table == "forbidden_table" else 200
+            if table == "forbidden_table":
+                raise ServiceNowForbiddenError(
+                    "HTTP-error-code: 403, Error: You are missing the following required scopes: read"
+                )
 
         client.get.side_effect = fake_get
 
@@ -381,7 +385,9 @@ class TestUnauthorisedTableHandling(unittest.TestCase):
                 + _dict_fields("table_b", "sys_id", "sys_updated_on")
             )
         }
-        client.get.return_value = 403
+        client.get.side_effect = ServiceNowForbiddenError(
+            "HTTP-error-code: 403, Error: You are missing the following required scopes: read"
+        )
 
         p1, p2 = _patch_tables(table_map, sync_list=["table_a", "table_b"])
         with p1, p2:

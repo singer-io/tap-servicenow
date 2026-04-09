@@ -7,7 +7,7 @@ from requests.exceptions import Timeout, ConnectionError, ChunkedEncodingError
 from singer import get_logger, metrics
 from requests.auth import HTTPBasicAuth
 
-from tap_servicenow.exceptions import ERROR_CODE_EXCEPTION_MAPPING, ServiceNowError, ServiceNowBackoffError, ServiceNowRateLimitError
+from tap_servicenow.exceptions import ERROR_CODE_EXCEPTION_MAPPING, ServiceNowError, ServiceNowBackoffError
 
 LOGGER = get_logger()
 REQUEST_TIMEOUT = 300
@@ -84,14 +84,20 @@ class Client:
         table: str,
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, Any]] = None
-    ) -> Any:
+    ) -> None:
+        """Lightweight access probe: raises ServiceNowError subclass on 4xx/5xx.
+
+        Routes through raise_for_error so callers receive typed exceptions
+        (e.g. ServiceNowForbiddenError) rather than raw status codes.
+        Callers that need to detect permission issues should catch
+        ServiceNowForbiddenError / ServiceNowUnauthorizedError.
+        """
         params = params or {}
         headers = headers or {}
         headers, params = self.authenticate(headers, params)
         url = f"{self.base_url}/{table}"
         response = self._session.get(url, headers=headers, params=params, timeout=self.request_timeout)
-
-        return response.status_code
+        raise_for_error(response)
 
     def make_request(
         self,
@@ -119,15 +125,15 @@ class Client:
         )
 
     @backoff.on_exception(
-        wait_gen=lambda: backoff.expo(factor=2),
+        wait_gen=backoff.expo,
+        factor=2,
         on_backoff=wait_if_retry_after,
         exception=(
             ConnectionResetError,
             ConnectionError,
             ChunkedEncodingError,
             Timeout,
-            ServiceNowBackoffError,
-            ServiceNowRateLimitError,
+            ServiceNowBackoffError,  # covers ServiceNowRateLimitError via inheritance
         ),
         max_tries=5,
     )

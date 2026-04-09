@@ -11,11 +11,18 @@ setup(name="tap-servicenow",
       classifiers=["Programming Language :: Python :: 3 :: Only"],
       py_modules=["tap_servicenow"],
       install_requires=[
-        "singer-python==6.1.1",
-        "requests==2.32.4",
+        "singer-python==6.8.0",
+        "requests==2.33.1",
         "backoff==2.2.1",
-        "parameterized"
+        "python-dateutil==2.9.0",
       ],
+      extras_require={
+          "dev": [
+              "parameterized",
+              "pytest",
+              "coverage",
+          ]
+      },
       entry_points="""
           [console_scripts]
           tap-servicenow=tap_servicenow:main

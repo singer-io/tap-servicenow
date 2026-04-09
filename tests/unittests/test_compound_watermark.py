@@ -274,11 +274,15 @@ class TestIncrementalSync(unittest.TestCase):
         self.assertFalse(any(r == {} for r in written))
 
     def test_returns_zero_on_exception(self):
-        """sync must catch unhandled exceptions, log critical, and return 0."""
+        """sync must catch ServiceNow API errors, log critical, and return 0.
+        Non-ServiceNow errors (programming bugs) must propagate.
+        """
+        from tap_servicenow.exceptions import ServiceNowForbiddenError
         client = MagicMock()
         client.base_url = "https://test.service-now.com/api/now/table"
         client.config = {"start_date": "2024-01-01T00:00:00Z"}
-        client.make_request.side_effect = RuntimeError("boom")
+        # Simulate a 403 that exhausted retries — a ServiceNowError subclass
+        client.make_request.side_effect = ServiceNowForbiddenError("403 Forbidden")
 
         stream = ConcreteIncremental(client, _make_catalog())
         stream.url_endpoint = "https://test.service-now.com/api/now/table/test_stream"
