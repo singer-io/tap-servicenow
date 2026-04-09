@@ -11,7 +11,7 @@ jobs:
             uv venv --python 3.12 /usr/local/share/virtualenvs/tap-servicenow
             source /usr/local/share/virtualenvs/tap-servicenow/bin/activate
             uv pip install -U setuptools
-            uv install .[dev]
+            uv pip install .[dev]
       - run:
           name: "pylint"
           command: |
