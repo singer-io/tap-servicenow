@@ -212,12 +212,21 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
                 LOGGER.warning(f"No fields found for table '{table}'. Skipping.")
                 continue
 
-            # Guarantee the two fields the tap always needs
             properties.setdefault("sys_id", {"type": ["string", "null"]})
-            properties.setdefault(
-                "sys_updated_on",
-                {"type": ["string", "null"], "format": "date-time"},
-            )
+
+            has_replication_key = "sys_updated_on" in properties
+            if has_replication_key:
+                replication_method = "INCREMENTAL"
+                valid_replication_keys = ["sys_updated_on"]
+            else:
+                # Table has no sys_updated_on — treat as FULL_TABLE.
+                # Every sync re-reads all rows; no bookmark is written.
+                replication_method = "FULL_TABLE"
+                valid_replication_keys = []
+                LOGGER.debug(
+                    f"Table '{table}' has no sys_updated_on field; "
+                    f"using FULL_TABLE replication."
+                )
 
             schema = {"type": "object", "properties": properties}
 
@@ -239,13 +248,14 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
             mdata = metadata.get_standard_metadata(
                 schema=schema,
                 key_properties=["sys_id"],
-                valid_replication_keys=["sys_updated_on"],
-                replication_method="INCREMENTAL",
+                valid_replication_keys=valid_replication_keys,
+                replication_method=replication_method,
             )
             mdata = metadata.to_map(mdata)
-            mdata = metadata.write(
-                mdata, ("properties", "sys_updated_on"), "inclusion", "automatic"
-            )
+            if has_replication_key:
+                mdata = metadata.write(
+                    mdata, ("properties", "sys_updated_on"), "inclusion", "automatic"
+                )
             field_metadata[table] = metadata.to_list(mdata)
 
         except Exception as exc:

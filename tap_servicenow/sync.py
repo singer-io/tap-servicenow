@@ -3,7 +3,7 @@ from typing import Dict
 from singer import metadata
 from tap_servicenow.streams import STREAMS, abstracts
 from tap_servicenow.client import Client
-from tap_servicenow.streams.abstracts import IncrementalStream
+from tap_servicenow.streams.abstracts import IncrementalStream, FullTableStream
 
 
 LOGGER = singer.get_logger()
@@ -54,7 +54,7 @@ def build_dynamic_stream(client, catalog_entry: singer.CatalogEntry) -> object:
         "is_dynamic": True
     }
 
-    base_class = IncrementalStream
+    base_class = FullTableStream if replication_method == "FULL_TABLE" else IncrementalStream
 
     DynamicStreamClass = type(
         f"Dynamic{stream_name.title()}Stream",
@@ -82,7 +82,6 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
     with singer.Transformer() as transformer:
         for stream_name in streams_to_sync:
             stream = build_dynamic_stream(client, catalog.get_stream(stream_name))
-            
             parent_name = getattr(stream, "parent", None)
             if parent_name:
                 if parent_name not in streams_to_sync:

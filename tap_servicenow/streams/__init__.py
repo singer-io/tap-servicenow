@@ -39,12 +39,10 @@ def get_all_tables(client, page_size: int = 500) -> Dict[str, str]:
     """
     table_map: Dict[str, str] = {}
     last_sys_id: str = ""
+    has_more: bool = True
 
-    while True:
-        if last_sys_id:
-            query = f"sys_id>{last_sys_id}^ORDERBYsys_id"
-        else:
-            query = "ORDERBYsys_id"
+    while has_more:
+        query = f"sys_id>{last_sys_id}^ORDERBYsys_id" if last_sys_id else "ORDERBYsys_id"
 
         params = {
             "sysparm_query": query,
@@ -61,8 +59,6 @@ def get_all_tables(client, page_size: int = 500) -> Dict[str, str]:
         )
 
         records = response.get("result", [])
-        if not records:
-            break
 
         for r in records:
             name = r.get("name") or ""
@@ -77,8 +73,8 @@ def get_all_tables(client, page_size: int = 500) -> Dict[str, str]:
             if sys_id:
                 last_sys_id = sys_id
 
-        if len(records) < page_size:
-            break
+        # Continue only if a full page was returned — partial page means last page
+        has_more = len(records) == page_size
 
     return table_map
 

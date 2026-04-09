@@ -14,7 +14,32 @@ from singer import (
 )
 
 import time
+from datetime import timezone
+import dateutil.parser
 from tap_servicenow.exceptions import ServiceNowForbiddenError
+
+
+def _to_snow_dt(value: str) -> str:
+    """
+    Normalise any datetime string to ServiceNow's native format:
+    ``YYYY-MM-DD HH:MM:SS`` (UTC, no T, no Z, no microseconds).
+
+    This ensures the bookmark stored in state is always comparable as
+    a plain string — mixing ISO-8601 (from start_date) and ServiceNow
+    native (from API records) produces wrong ``max()`` results because
+    ``T`` (ASCII 84) > space (ASCII 32).
+    """
+    if not value:
+        return value
+    try:
+        dt = dateutil.parser.parse(value)
+        # Treat naive datetimes as UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return value
 
 LOGGER = get_logger()
 
@@ -124,11 +149,12 @@ class BaseStream(ABC):
         """
         page_size = self.page_size or 1000
         last_sys_id: str = ""
+        has_more: bool = True
 
         # Build field selection from the schema defined on this stream
         fields: str = ",".join(self.schema.get("properties", {}).keys()) or ""
 
-        while True:
+        while has_more:
             try:
                 paginated_params = self.params.copy()
 
@@ -171,12 +197,11 @@ class BaseStream(ABC):
                         last_sys_id = record.get("sys_id", last_sys_id)
                         yield record
 
-                if len(raw_records) < page_size:
-                    break
+                has_more = len(raw_records) == page_size
 
             except ServiceNowForbiddenError as e:
                 LOGGER.critical(f"403 Forbidden on {self.url_endpoint}: {e}")
-                break
+                has_more = False
 
             except Exception as e:
                 LOGGER.error(f"Unexpected error while fetching records: {e}")
@@ -254,30 +279,16 @@ class IncrementalStream(BaseStream):
         parent_obj: Dict = None,
     ) -> Dict:
         """
-        Incremental sync using a **compound watermark** (sys_updated_on +
-        sys_id) combined with keyset pagination in a single unified cursor.
-
-        Single-field watermarks on sys_updated_on alone can miss records
-        that share the same timestamp second (documented as the
-        "Timestamp Problem" by Boris Moers / ServiceNow community).  The
-        compound pattern fixes this:
-
-            (sys_updated_on > last_dt)
-            OR (sys_updated_on = last_dt AND sys_id > last_sid)
-
-        sorted by both fields, so the last row of each page becomes the
-        next page's cursor *and* the persisted bookmark simultaneously.
+        Incremental sync using a sys_updated_on bookmark combined with keyset
+        pagination.  The query always uses >= so the bookmark row may be
+        re-read on the next sync; Singer destinations handle duplicates via
+        upsert on the primary key (sys_id).
         """
         replication_key = self.replication_keys[0] if self.replication_keys else "sys_updated_on"
 
-        # --- Retrieve compound bookmark -----------------------------------
-        bookmark_dt: str = self.get_bookmark(state, self.tap_stream_id)
-        bookmark_sid: str = get_bookmark(state, self.tap_stream_id, "sys_id_bookmark", "")
-
+        # --- Retrieve bookmark --------------------------------------------
+        bookmark_dt: str = _to_snow_dt(self.get_bookmark(state, self.tap_stream_id))
         current_max_dt: str = bookmark_dt
-        current_max_sid: str = bookmark_sid
-        # Keyset cursor advances with every page; starts at the bookmark.
-        last_page_sid: str = bookmark_sid
 
         page_size: int = self.page_size or 1000
         self.url_endpoint = self.get_url_endpoint(parent_obj)
@@ -289,18 +300,23 @@ class IncrementalStream(BaseStream):
 
         with metrics.record_counter(self.tap_stream_id) as counter:
             empty_record_count = 0
+            # Keyset cursor: track the last (sys_updated_on, sys_id) seen so we
+            # can advance the query on every page without using offset pagination.
+            last_page_dt: str = ""
+            last_page_sid: str = ""
+            has_more: bool = True
             try:
-                while True:
-                    # Build compound watermark + keyset query
-                    if last_page_sid:
-                        # Records strictly after the last seen position
+                while has_more:
+                    if last_page_dt and last_page_sid:
                         query = (
-                            f"{replication_key}>{bookmark_dt}"
-                            f"^OR{replication_key}={bookmark_dt}^sys_id>{last_page_sid}"
+                            f"{replication_key}>={bookmark_dt}"
+                            f"^{replication_key}>{last_page_dt}"
+                            f"^NQ{replication_key}>={bookmark_dt}"
+                            f"^{replication_key}={last_page_dt}"
+                            f"^sys_id>{last_page_sid}"
                             f"^ORDERBY{replication_key}^ORDERBYsys_id"
                         )
                     else:
-                        # First page of a fresh sync — use >= to include bookmark row
                         query = (
                             f"{replication_key}>={bookmark_dt}"
                             f"^ORDERBY{replication_key}^ORDERBYsys_id"
@@ -329,8 +345,6 @@ class IncrementalStream(BaseStream):
                         break
 
                     raw_records = response.get(self.data_key, [])
-                    if not raw_records:
-                        break
 
                     for record in raw_records:
                         if isinstance(record, dict) and not record:
@@ -339,19 +353,12 @@ class IncrementalStream(BaseStream):
 
                         record = self.modify_object(record, parent_obj)
 
-                        record_dt: str = record.get(replication_key) or bookmark_dt
+                        record_dt: str = _to_snow_dt(record.get(replication_key) or bookmark_dt)
                         record_sid: str = record.get("sys_id", "")
 
-                        # Advance compound cursor (both fields must move forward)
-                        if record_dt > current_max_dt or (
-                            record_dt == current_max_dt and record_sid > current_max_sid
-                        ):
-                            current_max_dt = record_dt
-                            current_max_sid = record_sid
-
-                        # Advance the keyset page cursor
-                        if record_sid:
-                            last_page_sid = record_sid
+                        # Advance the keyset cursor to the last record on this page
+                        last_page_dt = record_dt
+                        last_page_sid = record_sid
 
                         if record_dt >= bookmark_dt:
                             transformed_record = transformer.transform(
@@ -361,6 +368,10 @@ class IncrementalStream(BaseStream):
                                 write_record(self.tap_stream_id, transformed_record)
                                 counter.increment()
 
+                            # Only advance bookmark for records that were actually emitted
+                            if record_dt > current_max_dt:
+                                current_max_dt = record_dt
+
                             for child in self.child_to_sync:
                                 child.sync(
                                     state=state,
@@ -368,15 +379,10 @@ class IncrementalStream(BaseStream):
                                     parent_obj=record,
                                 )
 
-                    if len(raw_records) < page_size:
-                        break
+                    has_more = len(raw_records) == page_size
 
-                # --- Persist compound bookmark ----------------------------
                 state = write_bookmark(
                     state, self.tap_stream_id, replication_key, current_max_dt
-                )
-                state = write_bookmark(
-                    state, self.tap_stream_id, "sys_id_bookmark", current_max_sid
                 )
                 singer.write_state(state)
 

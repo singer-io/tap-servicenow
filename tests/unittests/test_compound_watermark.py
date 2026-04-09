@@ -1,6 +1,6 @@
 """
 Unit tests for:
-  - IncrementalStream.sync  — compound watermark (sys_updated_on + sys_id)
+  - IncrementalStream.sync  — sys_updated_on bookmark with keyset pagination
   - BaseStream.get_records  — keyset pagination (sys_id-based, no sysparm_offset)
 """
 import unittest
@@ -66,8 +66,8 @@ def _record(sys_id, updated_on, **extra):
 # IncrementalStream.sync — compound watermark
 # ---------------------------------------------------------------------------
 
-class TestIncrementalSyncCompoundWatermark(unittest.TestCase):
-
+class TestIncrementalSync(unittest.TestCase):
+    """Tests for IncrementalStream.sync() bookmark and query behaviour."""
     @patch("tap_servicenow.streams.abstracts.singer.write_state")
     @patch("tap_servicenow.streams.abstracts.write_record")
     @patch("tap_servicenow.streams.abstracts.write_bookmark")
@@ -80,9 +80,7 @@ class TestIncrementalSyncCompoundWatermark(unittest.TestCase):
             pages += extra_pages
         pages.append({"result": []})  # terminal empty page
 
-        mock_get_bm.side_effect = lambda s, st, key=None, default=None: (
-            state.get("sys_id_bookmark", "") if key == "sys_id_bookmark" else state.get("dt_bookmark", "2024-01-01T00:00:00Z")
-        )
+        mock_get_bm.return_value = state.get("dt_bookmark", "2024-01-01T00:00:00Z")
         mock_write_bm.side_effect = lambda s, st, k, v: s
 
         stream = ConcreteIncremental(_make_client(pages), _make_catalog())
@@ -96,10 +94,8 @@ class TestIncrementalSyncCompoundWatermark(unittest.TestCase):
 
     def test_initial_sync_uses_gte_operator(self):
         """
-        On the very first page when there is no sys_id bookmark (empty string)
-        the query must use sys_updated_on>= so the bookmark row itself is
-        included.  A key-aware side_effect distinguishes the two get_bookmark
-        calls (replication key vs sys_id_bookmark).
+        The query must always use sys_updated_on>= so the bookmark row is
+        included.  There is no compound OR clause any more.
         """
         recs = [_record("id-1", "2024-06-01T10:00:00Z")]
         client = _make_client([{"result": recs}, {"result": []}])
@@ -108,13 +104,7 @@ class TestIncrementalSyncCompoundWatermark(unittest.TestCase):
         stream = ConcreteIncremental(client, _make_catalog())
         stream.url_endpoint = "https://test.service-now.com/api/now/table/test_stream"
 
-        # Return empty string only for the sys_id_bookmark key so last_page_sid=""
-        def bm_side_effect(state, stream_name, key=None, default=None):
-            if key == "sys_id_bookmark":
-                return ""   # no prior sys_id bookmark → triggers >= path
-            return "2024-01-01T00:00:00Z"
-
-        with patch("tap_servicenow.streams.abstracts.get_bookmark", side_effect=bm_side_effect):
+        with patch("tap_servicenow.streams.abstracts.get_bookmark", return_value="2024-01-01T00:00:00Z"):
             with patch("tap_servicenow.streams.abstracts.write_bookmark", side_effect=lambda s, st, k, v: s):
                 with patch("tap_servicenow.streams.abstracts.singer.write_state"):
                     with patch("tap_servicenow.streams.abstracts.write_record"):
@@ -124,11 +114,12 @@ class TestIncrementalSyncCompoundWatermark(unittest.TestCase):
         first_call_params = client.make_request.call_args_list[0][0][2]
         query = first_call_params["sysparm_query"]
         self.assertIn("sys_updated_on>=", query)
+        self.assertNotIn("ORsys_updated_on=", query)  # no compound OR clause
 
-    def test_subsequent_page_uses_compound_or_clause(self):
+    def test_subsequent_page_still_uses_gte_operator(self):
         """
-        After the first record is seen, subsequent pages must use the compound
-        (sys_updated_on>X)^OR(sys_updated_on=X^sys_id>Y)^ORDERBY... query.
+        Even after processing the first page, subsequent pages still use
+        sys_updated_on>= (no compound OR clause).
         """
         page1 = [_record(f"id-{i}", "2024-06-01T10:00:00Z") for i in range(5)]
         page2 = [_record("id-99", "2024-06-01T11:00:00Z")]
@@ -148,9 +139,8 @@ class TestIncrementalSyncCompoundWatermark(unittest.TestCase):
 
         second_call_params = client.make_request.call_args_list[1][0][2]
         query = second_call_params["sysparm_query"]
-        # Compound or clause must be present
-        self.assertIn("ORsys_updated_on=", query)
-        self.assertIn("sys_id>", query)
+        self.assertIn("sys_updated_on>=", query)
+        self.assertNotIn("ORsys_updated_on=", query)
 
     def test_orderby_both_fields(self):
         """Query must sort by sys_updated_on then sys_id."""
@@ -173,8 +163,8 @@ class TestIncrementalSyncCompoundWatermark(unittest.TestCase):
         self.assertIn("ORDERBYsys_updated_on", query)
         self.assertIn("ORDERBYsys_id", query)
 
-    def test_both_bookmark_fields_written(self):
-        """write_bookmark must be called for sys_updated_on AND sys_id_bookmark."""
+    def test_only_sys_updated_on_bookmark_written(self):
+        """write_bookmark must be called only for sys_updated_on (no sys_id_bookmark)."""
         page = [_record("id-A", "2024-06-01T10:00:00Z")]
         client = _make_client([{"result": page}, {"result": []}])
         client.config = {"start_date": "2024-01-01T00:00:00Z"}
@@ -195,7 +185,7 @@ class TestIncrementalSyncCompoundWatermark(unittest.TestCase):
                             stream.sync(state={}, transformer=t)
 
         self.assertIn("sys_updated_on", written_keys)
-        self.assertIn("sys_id_bookmark", written_keys)
+        self.assertNotIn("sys_id_bookmark", written_keys)
 
     def test_no_offset_param_in_sync_requests(self):
         """sysparm_offset must never appear in incremental sync requests."""
