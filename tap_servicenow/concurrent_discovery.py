@@ -257,11 +257,14 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
             len(tables),
             self.max_workers,
         )
-        results = self.run(tables)
+        result_map = {item["table"]: item for item in self.run(tables)}
 
+        # Re-order by the original `tables` list so catalog stream order is
+        # deterministic across runs (as_completed yields in random order).
         schemas: Dict = {}
         field_metadata: Dict = {}
-        for item in results:
-            schemas[item["table"]] = item["schema"]
-            field_metadata[item["table"]] = item["metadata"]
+        for table in tables:
+            if table in result_map:
+                schemas[table] = result_map[table]["schema"]
+                field_metadata[table] = result_map[table]["metadata"]
         return schemas, field_metadata
