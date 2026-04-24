@@ -21,13 +21,7 @@ from tap_servicenow.exceptions import ServiceNowError, ServiceNowForbiddenError
 
 def _to_snow_dt(value: str) -> str:
     """
-    Normalise any datetime string to ServiceNow's native format:
-    ``YYYY-MM-DD HH:MM:SS`` (UTC, no T, no Z, no microseconds).
-
-    This ensures the bookmark stored in state is always comparable as
-    a plain string — mixing ISO-8601 (from start_date) and ServiceNow
-    native (from API records) produces wrong ``max()`` results because
-    ``T`` (ASCII 84) > space (ASCII 32).
+    Normalise any datetime string to ServiceNow's native format
     """
     if not value:
         return value
@@ -58,7 +52,6 @@ class BaseStream(ABC):
     url_endpoint = ""
     path = ""
     # Page size between 500-2000 per ServiceNow community best practice.
-    # 5000 was the root-cause of the Oct-2025 REST transaction quota breach.
     page_size = 1000
     next_page_key = ""
     headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
@@ -281,8 +274,7 @@ class IncrementalStream(BaseStream):
         """
         Incremental sync using a sys_updated_on bookmark combined with keyset
         pagination.  The query always uses >= so the bookmark row may be
-        re-read on the next sync; Singer destinations handle duplicates via
-        upsert on the primary key (sys_id).
+        re-read on the next sync.
         """
         replication_key = self.replication_keys[0] if self.replication_keys else "sys_updated_on"
 
@@ -398,7 +390,6 @@ class IncrementalStream(BaseStream):
                 # (e.g. 403 Forbidden). Log and skip this stream gracefully.
                 LOGGER.critical(f"Skipping stream '{self.tap_stream_id}' due to: {e}")
                 return 0
-            # All other exceptions (programming errors, KeyError, etc.) propagate
 
 
 class FullTableStream(BaseStream):
