@@ -88,19 +88,6 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
     """
     Fetch dynamic schemas and metadata for all ServiceNow tables.
 
-    Key improvements over the previous implementation:
-
-    1. **Table filtering** – default exclusion list (audit/log tables) applied
-       via :func:`get_sync_tables`; configurable via ``include_tables`` /
-       ``exclude_tables`` config keys.
-    2. **Batch sys_dictionary queries** – fields are fetched for up to
-       DICT_CHUNK_SIZE tables per API call using the ``nameIN`` encoded-query
-       operator, replacing ~12,600 individual calls from the prior version.
-    3. **Table-inheritance resolution** – the super_class chain returned by
-       :func:`get_all_tables` is walked so that fields inherited from ancestor
-       tables (e.g. ``incident`` → ``task``) are merged into child schemas,
-       preventing silent data loss.
-
     Returns:
         Tuple[Dict, Dict]: (schemas, field_metadata)
     """
@@ -108,20 +95,13 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
     config = getattr(client, "config", {})
     max_workers = int(config.get("discovery_max_workers", 10))
 
-    # ------------------------------------------------------------------
-    # Enumerate all tables (full map for inheritance) then filter
-    # ------------------------------------------------------------------
     LOGGER.info("Enumerating tables from sys_db_object (keyset pagination)...")
     table_map: Dict[str, str] = get_all_tables(client)          # {name: super_class}
     sync_tables = get_sync_tables(table_map, config)            # filtered list
     LOGGER.info(
-        f"Discovered {len(table_map)} total tables; "
+        f"Discovered {len(table_map)} total tables; {len(sync_tables)} selected for sync."
     )
 
-    # ------------------------------------------------------------------
-    # Collect every table name needed for inheritance resolution
-    # (sync tables PLUS all their ancestors, even excluded ones)
-    # ------------------------------------------------------------------
     all_needed: set = set(sync_tables)
     for name in sync_tables:
         current = table_map.get(name, "")
@@ -131,9 +111,6 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
             visited.add(current)
             current = table_map.get(current, "")
 
-    # ------------------------------------------------------------------
-    # Batch-fetch sys_dictionary for all needed tables (concurrent)
-    # ------------------------------------------------------------------
     DICT_CHUNK_SIZE = 50   # tables per sys_dictionary request
 
     all_needed_list = sorted(all_needed)
@@ -141,18 +118,11 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
         client, max_workers=max_workers
     ).fetch(all_needed_list, chunk_size=DICT_CHUNK_SIZE)
 
-    # ------------------------------------------------------------------
-    # Build schemas + Singer metadata concurrently
-    #             (inheritance resolution + access probe per table)
-    # ------------------------------------------------------------------
     builder = ServiceNowTableSchemaBuilder(
         client, field_map, table_map, max_workers=max_workers
     )
     schemas, field_metadata = builder.build(sync_tables)
 
-    # ------------------------------------------------------------------
-    # Deferred unauthorised-table summary
-    # ------------------------------------------------------------------
     unauthorized_tables = builder.unauthorized_tables
     if unauthorized_tables:
         total   = len(sync_tables)

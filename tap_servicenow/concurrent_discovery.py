@@ -1,33 +1,8 @@
-"""
-concurrent_discovery.py
-~~~~~~~~~~~~~~~~~~~~~~~
-Generic concurrent discovery framework and ServiceNow-specific implementations.
+"""concurrent_discovery.py — Speeds up ServiceNow catalog discovery using threads.
 
-Generic base class
-------------------
-:class:`ConcurrentDiscovery` is a reusable, tap-agnostic ABC.  To use it in
-another tap:
-
-1. Subclass it and implement :meth:`process_item`.
-2. Build the list of "items" to process (table names, endpoint slugs, …).
-3. Call :meth:`run` — results are returned as a plain list, in completion order.
-
-ServiceNow classes
-------------------
-* :class:`ServiceNowDictionaryFetcher` — parallelises ``sys_dictionary`` batch
-  chunk requests (Step 3 of discovery).
-* :class:`ServiceNowTableSchemaBuilder` — parallelises per-table schema
-  construction and lightweight access probes (Steps 4+5 of discovery).
-
-Thread-safety notes
--------------------
-``requests.Session`` is not officially thread-safe, but the only mutable
-session state set here is ``_session.auth``, which every thread writes to the
-same value (username/password never change mid-run).  The underlying
-``urllib3`` connection pool IS thread-safe for concurrent reads, so the
-pattern works reliably in practice for read-only discovery.  If you need
-strict thread-safety, inject one session-per-thread via a thread-local or use
-a fresh ``Client`` per worker.
+Splits the two slowest discovery phases (sys_dictionary fetching and
+per-table schema building) across a ThreadPoolExecutor so many ServiceNow
+API calls run in parallel instead of sequentially.
 """
 
 from __future__ import annotations
@@ -46,68 +21,18 @@ from tap_servicenow.streams import servicenow_type_to_json_type
 LOGGER = singer.get_logger()
 
 
-# ---------------------------------------------------------------------------
-# Generic reusable base
-# ---------------------------------------------------------------------------
-
 class ConcurrentDiscovery(ABC):
-    """
-    Generic base class for running discovery tasks concurrently across a
-    collection of items.
-
-    Subclasses implement :meth:`process_item` to define the work done for each
-    individual item.  :meth:`run` submits all items to a
-    ``ThreadPoolExecutor``, collects non-``None`` results, and returns them
-    in completion order.
-
-    The base class shares **no** mutable state between worker threads.
-    Subclasses that maintain shared state (caches, error accumulators, …) are
-    responsible for protecting it with appropriate locks — see
-    :class:`ServiceNowTableSchemaBuilder` for a reference implementation.
-
-    Parameters
-    ----------
-    max_workers:
-        Maximum number of concurrent worker threads.  Tune this to stay within
-        the upstream API's rate limits.  Defaults to 10.
-
-    Example (minimal)::
-
-        class MyDiscovery(ConcurrentDiscovery):
-            def process_item(self, item):
-                return fetch_schema(item)   # return None to skip an item
-
-        results = MyDiscovery(max_workers=20).run(my_items)
-    """
+    """Drives a ServiceNow discovery phase by executing API calls in parallel threads."""
 
     def __init__(self, max_workers: int = 10) -> None:
         self.max_workers = max_workers
 
     @abstractmethod
     def process_item(self, item: Any) -> Optional[Any]:
-        """
-        Process a single item and return a result, or ``None`` to skip it.
-
-        This method is called concurrently from worker threads.  Exceptions
-        raised here are caught by :meth:`run`, logged as errors, and the item
-        is silently skipped — they do **not** propagate to the caller.
-        """
+        """Perform the discovery work for a single item (table or chunk). Return None to skip."""
 
     def run(self, items: Iterable) -> List:
-        """
-        Submit all *items* to the thread pool and return collected results.
-
-        Parameters
-        ----------
-        items:
-            Any iterable of items to pass to :meth:`process_item`.
-
-        Returns
-        -------
-        List
-            Non-``None`` results from :meth:`process_item`, in completion
-            order (non-deterministic across runs).
-        """
+        """Fire all items through the thread pool and collect non-None results."""
         results: List = []
         items_list = list(items)
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -128,29 +53,11 @@ class ConcurrentDiscovery(ABC):
         return results
 
 
-# ---------------------------------------------------------------------------
-# ServiceNow: parallel sys_dictionary fetcher
-# ---------------------------------------------------------------------------
-
 class ServiceNowDictionaryFetcher(ConcurrentDiscovery):
-    """
-    Fetches ``sys_dictionary`` field definitions for a large set of ServiceNow
-    table names using concurrent API calls.
+    """Fetches field definitions from sys_dictionary for all discovered ServiceNow tables.
 
-    Discovery previously issued one HTTP request per table; this class batches
-    tables with the ``nameIN<list>`` encoded-query operator (one request per
-    *chunk_size* tables) and fires all chunks concurrently, dramatically
-    reducing wall-clock time.
-
-    Parameters
-    ----------
-    client:
-        An initialised tap client exposing ``make_request`` and ``base_url``.
-    dict_page_size:
-        ``sysparm_limit`` per API call — must be large enough to cover all
-        fields in the widest table in a chunk.  Defaults to 10 000.
-    max_workers:
-        Concurrency level.  Defaults to 10.
+    Groups tables into chunks and fires each chunk as a parallel API request
+    using the nameIN encoded-query operator.
     """
 
     def __init__(
@@ -163,16 +70,8 @@ class ServiceNowDictionaryFetcher(ConcurrentDiscovery):
         self.client = client
         self.dict_page_size = dict_page_size
 
-    # ------------------------------------------------------------------
-    # ConcurrentDiscovery interface
-    # ------------------------------------------------------------------
-
     def process_item(self, chunk: List[str]) -> Optional[Dict[str, Dict]]:
-        """
-        Fetch ``sys_dictionary`` rows for the table names in *chunk* (one API
-        call).  Returns a partial ``{table: {field: json_type}}`` dict, or
-        ``None`` if the request fails.
-        """
+        """Query sys_dictionary for one batch of ServiceNow tables. Returns {table: {field: type}}."""
         names_in = ",".join(chunk)
         params = {
             "sysparm_query": f"nameIN{names_in}",
@@ -207,34 +106,12 @@ class ServiceNowDictionaryFetcher(ConcurrentDiscovery):
             partial.setdefault(tbl, {})[elem] = servicenow_type_to_json_type(stype)
         return partial
 
-    # ------------------------------------------------------------------
-    # High-level entry point
-    # ------------------------------------------------------------------
-
     def fetch(
         self,
         table_names: List[str],
         chunk_size: int = 50,
     ) -> Dict[str, Dict]:
-        """
-        Fetch field definitions for all *table_names* concurrently.
-
-        Splits *table_names* into chunks of *chunk_size*, fires all chunks
-        through the thread pool, then merges the partial results.
-
-        Parameters
-        ----------
-        table_names:
-            Sorted list of table names to look up in ``sys_dictionary``.
-        chunk_size:
-            Number of tables per individual API request.  Larger values mean
-            fewer round-trips but larger response payloads.
-
-        Returns
-        -------
-        Dict[str, Dict]
-            ``field_map[table_name][element_name]`` → JSON Schema type dict.
-        """
+        """Fetch field types for all ServiceNow tables and return {table: {field: json_type}}."""
         chunks = [
             table_names[i : i + chunk_size]
             for i in range(0, len(table_names), chunk_size)
@@ -256,38 +133,12 @@ class ServiceNowDictionaryFetcher(ConcurrentDiscovery):
         return field_map
 
 
-# ---------------------------------------------------------------------------
-# ServiceNow: parallel table schema builder
-# ---------------------------------------------------------------------------
-
 class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
-    """
-    Builds Singer catalog schemas and metadata for a list of ServiceNow tables
-    concurrently, including a lightweight per-table access probe.
+    """Builds the Singer catalog schema and metadata for each ServiceNow table in parallel.
 
-    This class owns the field-inheritance resolution logic (walking the
-    ``super_class`` chain) and uses a thread-safe cache so that ancestor
-    lookups are computed at most once across all concurrent workers.
-
-    Parameters
-    ----------
-    client:
-        An initialised tap client exposing ``get`` (access probe) and the
-        ``config`` dict.
-    field_map:
-        Pre-fetched ``{table_name: {field_name: json_type}}`` mapping, e.g.
-        as returned by :meth:`ServiceNowDictionaryFetcher.fetch`.
-    table_map:
-        Full ``{table_name: super_class_name}`` map for inheritance
-        resolution, as returned by ``get_all_tables``.
-    max_workers:
-        Concurrency level.  Defaults to 10.
-
-    Attributes
-    ----------
-    unauthorized_tables : List[str]
-        Tables skipped because the configured credentials returned 401/403.
-        Populated after :meth:`build` returns.
+    Resolves inherited fields by walking the super_class chain, then runs a
+    lightweight API access probe per table. Unauthorized tables are collected
+    in self.unauthorized_tables after build() completes.
     """
 
     def __init__(
@@ -308,24 +159,12 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
         self.unauthorized_tables: List[str] = []
         self._unauth_lock = threading.Lock()
 
-    # ------------------------------------------------------------------
-    # Inheritance resolution (thread-safe)
-    # ------------------------------------------------------------------
-
     def _resolve_fields(
         self,
         table_name: str,
         _visiting: Optional[frozenset] = None,
     ) -> Dict:
-        """
-        Return the merged field dict for *table_name* including all ancestor
-        fields.  Results are memoised in ``_resolve_cache`` (thread-safe).
-        Child fields override parent fields (child wins).
-
-        Uses ``frozenset`` for the visitation set so it can be safely shared
-        across recursive, potentially-concurrent calls without defensive
-        copies.
-        """
+        """Walk the super_class chain and merge all inherited fields into the table's schema."""
         with self._cache_lock:
             if table_name in self._resolve_cache:
                 return self._resolve_cache[table_name]
@@ -347,21 +186,11 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
             self._resolve_cache[table_name] = merged
         return merged
 
-    # ------------------------------------------------------------------
-    # ConcurrentDiscovery interface
-    # ------------------------------------------------------------------
-
     def process_item(self, table: str) -> Optional[Dict]:
-        """
-        Build a Singer schema + metadata entry for *table* and verify API
-        access.
-
-        Returns a dict with keys ``"table"``, ``"schema"``, ``"metadata"``,
-        or ``None`` if the table should be skipped (no fields, access denied,
-        or any unhandled error).
-        """
+        """Build the Singer schema and metadata for one ServiceNow table and verify API access."""
         try:
-            properties = self._resolve_fields(table)
+            # Copy so we don't mutate the shared inheritance cache
+            properties = dict(self._resolve_fields(table))
 
             if not properties:
                 LOGGER.warning("No fields found for table '%s'. Skipping.", table)
@@ -420,28 +249,8 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
             LOGGER.error("Failed to build schema for table '%s': %s", table, exc)
             return None
 
-    # ------------------------------------------------------------------
-    # High-level entry point
-    # ------------------------------------------------------------------
-
     def build(self, tables: List[str]) -> Tuple[Dict, Dict]:
-        """
-        Concurrently process all *tables* and return their schemas and Singer
-        metadata.
-
-        Parameters
-        ----------
-        tables:
-            List of table names to build schemas for.
-
-        Returns
-        -------
-        Tuple[Dict, Dict]
-            ``(schemas, field_metadata)`` dicts keyed by table name.
-            Tables that were skipped (no fields, access denied, errors) are
-            absent from both dicts.  Unauthorised tables are also recorded in
-            :attr:`unauthorized_tables`.
-        """
+        """Build Singer schemas and metadata for all ServiceNow sync tables. Returns (schemas, field_metadata)."""
         LOGGER.info(
             "ServiceNowTableSchemaBuilder: processing %d tables "
             "(max_workers=%d)",
