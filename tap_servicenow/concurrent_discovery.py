@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -156,6 +157,7 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
         # Shared state — protected by locks
         self._resolve_cache: Dict[str, Dict] = {}
         self._cache_lock = threading.Lock()
+        self._key_locks: Dict[str, threading.Lock] = defaultdict(threading.Lock)
         self.unauthorized_tables: List[str] = []
         self._unauth_lock = threading.Lock()
 
@@ -165,26 +167,39 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
         _visiting: Optional[frozenset] = None,
     ) -> Dict:
         """Walk the super_class chain and merge all inherited fields into the table's schema."""
+        # Cycle guard — must run before acquiring the per-key lock; otherwise a
+        # cyclic inheritance chain (A→B→A) would cause the same thread to try to
+        # re-acquire a non-reentrant Lock it already holds → deadlock.
+        visiting = _visiting or frozenset()
+        if table_name in visiting:
+            return {}
+        visiting = visiting | {table_name}
+
+        # Fast path: check shared cache first
         with self._cache_lock:
             if table_name in self._resolve_cache:
                 return self._resolve_cache[table_name]
 
-        visiting = _visiting or frozenset()
-        if table_name in visiting:   # cycle guard
-            return {}
-        visiting = visiting | {table_name}
+        # Acquire the per-key lock — only threads computing THIS table block here
+        with self._key_locks[table_name]:
+            # Double-check: another thread may have computed it while we waited
+            with self._cache_lock:
+                if table_name in self._resolve_cache:
+                    return self._resolve_cache[table_name]
 
-        own_fields = self.field_map.get(table_name, {}).copy()
-        super_class = self.table_map.get(table_name, "")
-        if super_class:
-            parent_fields = self._resolve_fields(super_class, visiting)
-            merged = {**parent_fields, **own_fields}   # child overrides parent
-        else:
-            merged = own_fields
+            # Now we are the sole thread computing this table
 
-        with self._cache_lock:
-            self._resolve_cache[table_name] = merged
-        return merged
+            own_fields = self.field_map.get(table_name, {}).copy()
+            super_class = self.table_map.get(table_name, "")
+            if super_class:
+                parent_fields = self._resolve_fields(super_class, visiting)
+                merged = {**parent_fields, **own_fields}   # child overrides parent
+            else:
+                merged = own_fields
+
+            with self._cache_lock:
+                self._resolve_cache[table_name] = merged
+            return merged
 
     def process_item(self, table: str) -> Optional[Dict]:
         """Build the Singer schema and metadata for one ServiceNow table and verify API access."""
