@@ -111,24 +111,24 @@ def get_sync_tables(
 
 
 def servicenow_type_to_json_type(snow_type: str) -> Dict[str, Union[str, List[str]]]:
-        """
-        Map ServiceNow field types to JSON Schema types.
-        """
-        mapping = {
-            "string": {"type": ["string", "null"]},
-            "glide_date_time": {"type": ["string", "null"], "format": "date-time"},
-            "glide_date": {"type": ["string", "null"], "format": "date-time"},
-            "int": {"type": ["integer", "null"]},
-            "integer": {"type": ["integer", "null"]},
-            "float": {"type": ["number", "null"]},
-            "boolean": {"type": ["boolean", "null"]},
-            "reference": {"type": ["string", "null"]},
-            "currency": {"type": ["number", "null"]},
-            "text": {"type": ["string", "null"]},
-            "html": {"type": ["string", "null"]},
-            "url": {"type": ["string", "null"]},
-            "email": {"type": ["string", "null"]},
-            # Add as per need
-        }
+    """
+    Map ServiceNow field types to JSON Schema types.
+    """
+    mapping = {
+        "string": {"type": ["string", "null"]},
+        "glide_date_time": {"type": ["string", "null"], "format": "date-time"},
+        "glide_date": {"type": ["string", "null"], "format": "date-time"},
+        "int": {"type": ["integer", "null"]},
+        "integer": {"type": ["integer", "null"]},
+        "float": {"type": ["number", "null"]},
+        "boolean": {"type": ["boolean", "null"]},
+        "reference": {"type": ["string", "null"]},
+        "currency": {"type": ["number", "null"]},
+        "text": {"type": ["string", "null"]},
+        "html": {"type": ["string", "null"]},
+        "url": {"type": ["string", "null"]},
+        "email": {"type": ["string", "null"]},
+        # Add as per need
+    }
 
-        return mapping.get(snow_type.lower(), {"type": ["string", "null"]})
+    return mapping.get(snow_type.lower(), {"type": ["string", "null"]})
