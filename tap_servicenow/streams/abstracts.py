@@ -193,11 +193,11 @@ class BaseStream(ABC):
                 has_more = len(raw_records) == page_size
 
             except ServiceNowForbiddenError as e:
-                LOGGER.critical(f"403 Forbidden on {self.url_endpoint}: {e}")
+                LOGGER.critical("403 Forbidden on %s: %s", self.url_endpoint, e)
                 has_more = False
 
             except Exception as e:
-                LOGGER.error(f"Unexpected error while fetching records: {e}")
+                LOGGER.error("Unexpected error while fetching records: %s", e)
                 raise
 
 
@@ -333,7 +333,7 @@ class IncrementalStream(BaseStream):
                             path=self.path,
                         )
                     except ServiceNowForbiddenError as e:
-                        LOGGER.critical(f"403 Forbidden on {self.url_endpoint}: {e}")
+                        LOGGER.critical("403 Forbidden on %s: %s", self.url_endpoint, e)
                         break
 
                     raw_records = response.get(self.data_key, [])
@@ -380,15 +380,16 @@ class IncrementalStream(BaseStream):
 
                 if empty_record_count > 0:
                     LOGGER.warning(
-                        f"Stream '{self.tap_stream_id}' encountered {empty_record_count} "
-                        f"empty records (possibly due to missing data-level permissions)."
+                        "Stream '%s' encountered %d empty records "
+                        "(possibly due to missing data-level permissions).",
+                        self.tap_stream_id, empty_record_count
                     )
                 return counter.value
 
             except ServiceNowError as e:
                 # A ServiceNow API error that exhausted retries or is non-retryable
                 # (e.g. 403 Forbidden). Log and skip this stream gracefully.
-                LOGGER.critical(f"Skipping stream '{self.tap_stream_id}' due to: {e}")
+                LOGGER.critical("Skipping stream '%s' due to: %s", self.tap_stream_id, e)
                 return 0
 
 

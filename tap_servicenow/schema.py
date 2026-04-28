@@ -99,7 +99,8 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
     table_map: Dict[str, str] = get_all_tables(client)          # {name: super_class}
     sync_tables = get_sync_tables(table_map, config)            # filtered list
     LOGGER.info(
-        f"Discovered {len(table_map)} total tables; {len(sync_tables)} selected for sync."
+        "Discovered %d total tables; %d selected for sync.",
+        len(table_map), len(sync_tables)
     )
 
     all_needed: set = set(sync_tables)
@@ -130,8 +131,9 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
         tables_str = ", ".join(unauthorized_tables)
         if blocked < total:
             LOGGER.warning(
-                f"Credentials lack access to {blocked} table(s): {tables_str}. "
-                f"These tables were skipped due to insufficient permissions."
+                "Credentials lack access to %d table(s): %s. "
+                "These tables were skipped due to insufficient permissions.",
+                blocked, tables_str
             )
         else:
             raise Exception(
