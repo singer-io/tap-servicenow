@@ -158,8 +158,14 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
         self._resolve_cache: Dict[str, Dict] = {}
         self._cache_lock = threading.Lock()
         self._key_locks: Dict[str, threading.Lock] = defaultdict(threading.Lock)
+        self._key_locks_lock = threading.Lock()
         self.unauthorized_tables: List[str] = []
         self._unauth_lock = threading.Lock()
+
+    def _get_key_lock(self, table_name: str) -> threading.Lock:
+        """Return the per-table lock, creating it if needed, under an explicit lock."""
+        with self._key_locks_lock:
+            return self._key_locks[table_name]
 
     def _resolve_fields(
         self,
@@ -181,7 +187,7 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
                 return self._resolve_cache[table_name]
 
         # Acquire the per-key lock — only threads computing THIS table block here
-        with self._key_locks[table_name]:
+        with self._get_key_lock(table_name):
             # Double-check: another thread may have computed it while we waited
             with self._cache_lock:
                 if table_name in self._resolve_cache:
