@@ -8,6 +8,7 @@ from tap_servicenow.exceptions import *
 
 
 default_config = {
+    "instance": "mock-instance",
     "base_url": "https://api.example.com",
     "request_timeout": 30,
     "auth_token": "dummy_token",
@@ -67,28 +68,13 @@ class TestClient(unittest.TestCase):
         assert client.request_timeout == expected_value
         assert isinstance(client._session, mock_session().__class__)
 
-
-    @patch("tap_servicenow.client.Client._Client__make_request")
-    def test_client_get(self, mock_make_request):
-        mock_make_request.return_value = {"data": "ok"}
-        result = self.client.get("https://api.example.com/resource")
-        assert result == {"data": "ok"}
-        mock_make_request.assert_called_once()
-
-
-    @patch("tap_servicenow.client.Client._Client__make_request")
-    def test_client_post(self, mock_make_request):
-        mock_make_request.return_value = {"created": True}
-        result = self.client.post("https://api.example.com/resource", body={"key": "value"})
-        assert result == {"created": True}
-        mock_make_request.assert_called_once()
-
     @parameterized.expand([
         ["400 error", 400, MockResponse(400), ServiceNowBadRequestError, "A validation exception has occurred."],
         ["401 error", 401, MockResponse(401), ServiceNowUnauthorizedError, "The access token provided is expired, revoked, malformed or invalid for other reasons."],
         ["403 error", 403, MockResponse(403), ServiceNowForbiddenError, "You are missing the following required scopes: read"],
         ["404 error", 404, MockResponse(404), ServiceNowNotFoundError, "The resource you have specified cannot be found."],
         ["409 error", 409, MockResponse(409), ServiceNowConflictError, "The API request cannot be completed because the requested operation would conflict with an existing item."],
+        ["422 error", 422, MockResponse(422), ServiceNowUnprocessableEntityError, "The request content itself is not processable by the server."],
     ])
     def test_make_request_http_failure_without_retry(self, test_name, error_code, mock_response, error, error_message):
         
@@ -100,8 +86,7 @@ class TestClient(unittest.TestCase):
         self.assertEqual(str(e.exception), expected_error_message)
 
     @parameterized.expand([
-        ["422 error", 422, MockResponse(422), ServiceNowUnprocessableEntityError, "The request content itself is not processable by the server."],
-        ["429 error", 429, MockResponse(429), ServiceNowRateLimitError, "The API rate limit for your organisation/application pairing has been exceeded."],
+        ["429 error", 429, MockResponse(429, headers={"Retry-After": "2"}), ServiceNowRateLimitError, "The API rate limit for your organisation/application pairing has been exceeded. (Retry after 2 seconds.)"],
         ["500 error", 500, MockResponse(500), ServiceNowInternalServerError, "The server encountered an unexpected condition which prevented it from fulfilling the request."],
         ["501 error", 501, MockResponse(501), ServiceNowNotImplementedError, "The server does not support the functionality required to fulfill the request."],
         ["502 error", 502, MockResponse(502), ServiceNowBadGatewayError, "Server received an invalid response."],

@@ -1,10 +1,11 @@
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-import backoff
+import backoff, time
 import requests
 from requests import session
 from requests.exceptions import Timeout, ConnectionError, ChunkedEncodingError
 from singer import get_logger, metrics
+from requests.auth import HTTPBasicAuth
 
 from tap_servicenow.exceptions import ERROR_CODE_EXCEPTION_MAPPING, ServiceNowError, ServiceNowBackoffError
 
@@ -35,6 +36,14 @@ def raise_for_error(response: requests.Response) -> None:
         )
         raise exc(message, response) from None
 
+def wait_if_retry_after(details):
+    """Backoff handler that checks for a 'retry_after' attribute in the exception
+    and sleeps for the specified duration to respect API rate limits.
+    """
+    exc = details['exception']
+    if hasattr(exc, 'retry_after') and exc.retry_after is not None:
+        time.sleep(exc.retry_after)  # Force exact wait
+
 class Client:
     """
     A Wrapper class.
@@ -48,7 +57,7 @@ class Client:
     def __init__(self, config: Mapping[str, Any]) -> None:
         self.config = config
         self._session = session()
-        self.base_url = f"https://{config['instance']}.service-now.com/api/now"
+        self.base_url = f"https://{config['instance']}.service-now.com/api/now/table"
         config_request_timeout = config.get("request_timeout")
         self.request_timeout = float(config_request_timeout) if config_request_timeout else REQUEST_TIMEOUT
 
@@ -63,9 +72,32 @@ class Client:
         pass
 
     def authenticate(self, headers: Dict, params: Dict) -> Tuple[Dict, Dict]:
-        """Authenticates the request with the token"""
-        headers[""] = self.config[""]
+        """Authenticates the request with basic auth headers."""
+        self._session.auth = HTTPBasicAuth(
+            self.config["user"],
+            self.config["password"]
+        )
         return headers, params
+    
+    def get(
+        self,
+        table: str,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Lightweight access probe: raises ServiceNowError subclass on 4xx/5xx.
+
+        Routes through raise_for_error so callers receive typed exceptions
+        (e.g. ServiceNowForbiddenError) rather than raw status codes.
+        Callers that need to detect permission issues should catch
+        ServiceNowForbiddenError / ServiceNowUnauthorizedError.
+        """
+        params = params or {}
+        headers = headers or {}
+        headers, params = self.authenticate(headers, params)
+        url = f"{self.base_url}/{table}"
+        response = self._session.get(url, headers=headers, params=params, timeout=self.request_timeout)
+        raise_for_error(response)
 
     def make_request(
         self,
@@ -94,15 +126,16 @@ class Client:
 
     @backoff.on_exception(
         wait_gen=backoff.expo,
+        factor=2,
+        on_backoff=wait_if_retry_after,
         exception=(
             ConnectionResetError,
             ConnectionError,
             ChunkedEncodingError,
             Timeout,
-            ServiceNowBackoffError
+            ServiceNowBackoffError,  # covers ServiceNowRateLimitError via inheritance
         ),
         max_tries=5,
-        factor=2,
     )
     def __make_request(
         self, method: str, endpoint: str, **kwargs

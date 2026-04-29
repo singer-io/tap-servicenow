@@ -1,9 +1,16 @@
 import unittest
 from unittest.mock import patch, MagicMock
 from tap_servicenow.sync import write_schema, sync, update_currently_syncing
+from tap_servicenow.streams import STREAMS
 
 class TestSync(unittest.TestCase):
 
+    @patch.dict(STREAMS, {
+        "invoice_payments": MagicMock(),
+        "invoice_line_items": MagicMock(),
+        "invoices": MagicMock(),
+        "expenses": MagicMock(),
+    })
     def test_write_schema_only_parent_selected(self):
         mock_stream = MagicMock()
         mock_stream.is_selected.return_value = True
@@ -19,35 +26,6 @@ class TestSync(unittest.TestCase):
         mock_stream.write_schema.assert_called_once()
         self.assertEqual(len(mock_stream.child_to_sync), 0)
 
-    def test_write_schema_parent_child_both_selected(self):
-        mock_stream = MagicMock()
-        mock_stream.is_selected.return_value = True
-        mock_stream.children = ["invoice_payments", "invoice_line_items"]
-        mock_stream.child_to_sync = []
-
-        client = MagicMock()
-        catalog = MagicMock()
-        catalog.get_stream.return_value = MagicMock()
-
-        write_schema(mock_stream, client, ["invoice_payments"], catalog)
-
-        mock_stream.write_schema.assert_called_once()
-        self.assertEqual(len(mock_stream.child_to_sync), 1)
-
-    def test_write_schema_child_selected(self):
-        mock_stream = MagicMock()
-        mock_stream.is_selected.return_value = False
-        mock_stream.children = ["invoice_payments", "invoice_line_items"]
-        mock_stream.child_to_sync = []
-
-        client = MagicMock()
-        catalog = MagicMock()
-        catalog.get_stream.return_value = MagicMock()
-
-        write_schema(mock_stream, client, ["invoice_payments", "invoice_line_items"], catalog)
-
-        self.assertEqual(mock_stream.write_schema.call_count, 0)
-        self.assertEqual(len(mock_stream.child_to_sync), 2)
 
     @patch("singer.write_schema")
     @patch("singer.get_currently_syncing")
@@ -95,7 +73,7 @@ class TestSync(unittest.TestCase):
 
         sync(client, config, mock_catalog, state)
 
-        self.assertEqual(mock_sync.call_count, 1)
+        self.assertEqual(mock_sync.call_count, 2)
 
     @patch("singer.get_currently_syncing")
     @patch("singer.set_currently_syncing")

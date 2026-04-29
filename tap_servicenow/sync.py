@@ -1,7 +1,10 @@
 import singer
 from typing import Dict
-from tap_servicenow.streams import STREAMS
+from singer import metadata
+from tap_servicenow.streams import STREAMS, abstracts
 from tap_servicenow.client import Client
+from tap_servicenow.streams.abstracts import IncrementalStream, FullTableStream
+
 
 LOGGER = singer.get_logger()
 
@@ -31,6 +34,38 @@ def write_schema(stream, client, streams_to_sync, catalog) -> None:
             stream.child_to_sync.append(child_obj)
 
 
+def build_dynamic_stream(client, catalog_entry: singer.CatalogEntry) -> object:
+    """Create a dynamic stream instance based on stream_catalog."""
+    catalog_metadata = metadata.to_map(catalog_entry.metadata)
+
+    stream_name = catalog_entry.stream
+    key_properties = catalog_entry.key_properties
+    replication_method = catalog_metadata.get((), {}).get('forced-replication-method')
+    replication_keys = catalog_metadata.get((), {}).get('valid-replication-keys')
+
+    class_props = {
+        "__module__": abstracts.__name__,
+        "tap_stream_id": property(lambda self: stream_name),
+        "key_properties": property(lambda self: key_properties),
+        "replication_method": property(lambda self: replication_method),
+        "replication_keys": property(lambda self: replication_keys),
+        "path": stream_name,
+        "data_key": "result",
+        "is_dynamic": True
+    }
+
+    base_class = FullTableStream if replication_method == "FULL_TABLE" else IncrementalStream
+
+    DynamicStreamClass = type(
+        f"Dynamic{stream_name.title()}Stream",
+        (base_class,),
+        class_props
+    )
+    # This is safe because DynamicStreamClass is created at runtime with all required abstract methods
+    # implemented via the selected base class (IncrementalStream) and class_props.
+    return DynamicStreamClass(client, catalog_entry) # pylint: disable=abstract-class-instantiated
+
+
 def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
     """
     Sync selected streams from catalog
@@ -46,11 +81,11 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
 
     with singer.Transformer() as transformer:
         for stream_name in streams_to_sync:
-
-            stream = STREAMS[stream_name](client, catalog.get_stream(stream_name))
-            if stream.parent:
-                if stream.parent not in streams_to_sync:
-                    streams_to_sync.append(stream.parent)
+            stream = build_dynamic_stream(client, catalog.get_stream(stream_name))
+            parent_name = getattr(stream, "parent", None)
+            if parent_name:
+                if parent_name not in streams_to_sync:
+                    streams_to_sync.append(parent_name)
                 continue
 
             write_schema(stream, client, streams_to_sync, catalog)
@@ -64,4 +99,3 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
                     stream_name, total_records
                 )
             )
-

@@ -32,13 +32,40 @@ class ServiceNowConflictError(ServiceNowError):
     """class representing 409 status code."""
     pass
 
-class ServiceNowUnprocessableEntityError(ServiceNowBackoffError):
-    """class representing 422 status code."""
+class ServiceNowUnprocessableEntityError(ServiceNowError):
+    """class representing 422 status code.
+
+    422 Unprocessable Entity means the request syntax was valid but the
+    content is semantically incorrect (e.g. a bad sysparm_query string).
+    Retrying the same request will always fail, so this must NOT inherit
+    from ServiceNowBackoffError.
+    """
     pass
 
 class ServiceNowRateLimitError(ServiceNowBackoffError):
     """class representing 429 status code."""
-    pass
+    def __init__(self, message=None, response=None):
+        """Initialize the ServiceNowRateLimitError. Parses the 'Retry-After' header from the response (if present) and sets the
+            `retry_after` attribute accordingly.
+        """
+        self.response = response
+
+        # Retry-After header parsing
+        retry_after = None
+        if response and hasattr(response, 'headers'):
+            raw_retry = response.headers.get('Retry-After')
+            if raw_retry:
+                try:
+                    retry_after = int(raw_retry)
+                except ValueError:
+                    retry_after = None
+
+        self.retry_after = retry_after
+        base_msg = message or "Rate limit hit"
+        retry_info = f"(Retry after {self.retry_after} seconds.)" \
+            if self.retry_after is not None else "(Retry after unknown delay.)"
+        full_message = f"{base_msg} {retry_info}"
+        super().__init__(full_message, response=response)
 
 class ServiceNowInternalServerError(ServiceNowBackoffError):
     """class representing 500 status code."""

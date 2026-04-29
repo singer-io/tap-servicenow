@@ -7,14 +7,15 @@ from tap_servicenow.sync import sync
 
 LOGGER = singer.get_logger()
 
-REQUIRED_CONFIG_KEYS = ['instance', 'user', 'password']
+REQUIRED_CONFIG_KEYS = ['instance', 'user', 'password', 'start_date']
 
-def do_discover():
+
+def do_discover(client):
     """
-    Discover and emit the catalog to stdout
+    Discover and emit the catalog to stdout.
     """
     LOGGER.info("Starting discover")
-    catalog = discover()
+    catalog = discover(client)
     json.dump(catalog.to_dict(), sys.stdout, indent=2)
     LOGGER.info("Finished discover")
 
@@ -25,21 +26,19 @@ def main():
     Run the tap
     """
     parsed_args = singer.utils.parse_args(REQUIRED_CONFIG_KEYS)
-    state = {}
-    if parsed_args.state:
-        state = parsed_args.state
+    state = parsed_args.state or {}
 
     with Client(parsed_args.config) as client:
         if parsed_args.discover:
-            do_discover()
+            do_discover(client)
         elif parsed_args.catalog:
             sync(
                 client=client,
                 config=parsed_args.config,
                 catalog=parsed_args.catalog,
-                state=state)
+                state=state
+            )
 
 
 if __name__ == "__main__":
     main()
-

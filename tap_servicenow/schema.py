@@ -4,6 +4,11 @@ import singer
 from typing import Dict, Tuple
 from singer import metadata
 from tap_servicenow.streams import STREAMS
+from tap_servicenow.streams import get_all_tables, get_sync_tables
+from tap_servicenow.concurrent_discovery import (
+    ServiceNowDictionaryFetcher,
+    ServiceNowTableSchemaBuilder,
+)
 
 LOGGER = singer.get_logger()
 
@@ -69,8 +74,71 @@ def get_schemas() -> Tuple[Dict, Dict]:
                     mdata, ("properties", field_name), "inclusion", "automatic"
                 )
 
+        parent_tap_stream_id = getattr(stream_obj, "parent", None)
+        if parent_tap_stream_id:
+            mdata = metadata.write(mdata, (), 'parent-tap-stream-id', parent_tap_stream_id)
+
         mdata = metadata.to_list(mdata)
         field_metadata[stream_name] = mdata
 
     return schemas, field_metadata
 
+
+def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
+    """
+    Fetch dynamic schemas and metadata for all ServiceNow tables.
+
+    Returns:
+        Tuple[Dict, Dict]: (schemas, field_metadata)
+    """
+    LOGGER.info("Fetching dynamic schema from ServiceNow.")
+    config = getattr(client, "config", {})
+    max_workers = int(config.get("discovery_max_workers", 10))
+
+    LOGGER.info("Enumerating tables from sys_db_object (keyset pagination)...")
+    table_map: Dict[str, str] = get_all_tables(client)          # {name: super_class}
+    sync_tables = get_sync_tables(table_map, config)            # filtered list
+    LOGGER.info(
+        "Discovered %d total tables; %d selected for sync.",
+        len(table_map), len(sync_tables)
+    )
+
+    all_needed: set = set(sync_tables)
+    for name in sync_tables:
+        current = table_map.get(name, "")
+        visited: set = {name}
+        while current and current not in visited:
+            all_needed.add(current)
+            visited.add(current)
+            current = table_map.get(current, "")
+
+    DICT_CHUNK_SIZE = 50   # tables per sys_dictionary request
+
+    all_needed_list = sorted(all_needed)
+    field_map: Dict[str, Dict] = ServiceNowDictionaryFetcher(
+        client, max_workers=max_workers
+    ).fetch(all_needed_list, chunk_size=DICT_CHUNK_SIZE)
+
+    builder = ServiceNowTableSchemaBuilder(
+        client, field_map, table_map, max_workers=max_workers
+    )
+    schemas, field_metadata = builder.build(sync_tables)
+
+    unauthorized_tables = builder.unauthorized_tables
+    if unauthorized_tables:
+        total   = len(sync_tables)
+        blocked = len(unauthorized_tables)
+        tables_str = ", ".join(unauthorized_tables)
+        if blocked < total:
+            LOGGER.warning(
+                "Credentials lack access to %d table(s): %s. "
+                "These tables were skipped due to insufficient permissions.",
+                blocked, tables_str
+            )
+        else:
+            raise Exception(
+                "HTTP-error-code: 403. The account does not have 'read' access "
+                "to any of the ServiceNow tables. Data discovery cannot proceed."
+            )
+
+    return schemas, field_metadata

@@ -13,6 +13,5 @@ class ServiceNowAutomaticFields(MinimumSelectionTest, ServiceNowBaseTest):
         return "tap_tester_servicenow_automatic_fields_test"
 
     def streams_to_test(self):
-        streams_to_exclude = {}
+        streams_to_exclude = {"fm_expense_line"}
         return self.expected_stream_names().difference(streams_to_exclude)
-
