@@ -1,0 +1,7 @@
+{
+    "instance": "inci_id",
+    "user": "username",
+    "password": "password",
+    "start_date": "2020-07-01T00:00:00Z",
+    "discovery_max_workers": 10
+}

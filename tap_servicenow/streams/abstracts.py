@@ -1,0 +1,461 @@
+from abc import ABC, abstractmethod
+import json
+from typing import Any, Dict, Tuple, List, Iterator
+import singer
+from singer import (
+    Transformer,
+    get_bookmark,
+    get_logger,
+    metrics,
+    write_bookmark,
+    write_record,
+    write_schema,
+    metadata
+)
+
+import time
+from datetime import timezone
+import dateutil.parser
+from tap_servicenow.exceptions import ServiceNowError, ServiceNowForbiddenError
+
+
+def _to_snow_dt(value: str) -> str:
+    """
+    Normalise any datetime string to ServiceNow's native format
+    """
+    if not value:
+        return value
+    try:
+        dt = dateutil.parser.parse(value)
+        # Treat naive datetimes as UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return value
+
+LOGGER = get_logger()
+
+
+class BaseStream(ABC):
+    """
+    A Base Class providing structure and boilerplate for generic streams
+    and required attributes for any kind of stream
+    ~~~
+    Provides:
+     - Basic Attributes (stream_name,replication_method,key_properties)
+     - Helper methods for catalog generation
+     - `sync` and `get_records` method for performing sync
+    """
+
+    url_endpoint = ""
+    path = ""
+    # Page size between 500-2000 per ServiceNow community best practice.
+    page_size = 1000
+    next_page_key = ""
+    headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+    children = []
+    parent = ""
+    data_key = "result"
+    parent_bookmark_key = ""
+    http_method = "GET"
+
+    def __init__(self, client=None, catalog=None) -> None:
+        self.client = client
+        self.catalog = catalog
+        if catalog:
+            self.schema = catalog.schema.to_dict()
+            self.metadata = metadata.to_map(catalog.metadata)
+        else:
+            self.schema = {"type": "object", "properties": {}}
+            self.metadata = metadata.new()
+        self.child_to_sync = []
+        self.params = {}
+        self.data_payload = {}
+
+    @property
+    @abstractmethod
+    def tap_stream_id(self) -> str:
+        """Unique identifier for the stream.
+
+        This is allowed to be different from the name of the stream, in
+        order to allow for sources that have duplicate stream names.
+        """
+
+    @property
+    @abstractmethod
+    def replication_method(self) -> str:
+        """Defines the sync mode of a stream."""
+
+    @property
+    @abstractmethod
+    def replication_keys(self) -> List:
+        """Defines the replication key for incremental sync mode of a
+        stream."""
+
+    @property
+    @abstractmethod
+    def key_properties(self) -> Tuple[str, str]:
+        """List of key properties for stream."""
+
+    def is_selected(self):
+        return metadata.get(self.metadata, (), "selected")
+
+    @abstractmethod
+    def sync(
+        self,
+        state: Dict,
+        transformer: Transformer,
+        parent_obj: Dict = None,
+    ) -> Dict:
+        """
+        Performs a replication sync for the stream.
+        ~~~
+        Args:
+         - state (dict): represents the state file for the tap.
+         - transformer (object): A Object of the singer.transformer class.
+         - parent_obj (dict): The parent object for the stream.
+
+        Returns:
+         - bool: The return value. True for success, False otherwise.
+
+        Docs:
+         - https://github.com/singer-io/getting-started/blob/master/docs/SYNC_MODE.md
+        """
+
+    def get_records(self) -> Iterator:
+        """
+        Fetch records using **keyset pagination** (sys_id-based) instead of
+        offset-based pagination.  Offset pagination degrades linearly because
+        the database must re-scan and discard all preceding rows; keyset
+        pagination stays O(1) per page regardless of position.
+
+        Every request includes the three ServiceNow performance params:
+        - sysparm_no_count=true    – skips the expensive COUNT query
+        - sysparm_exclude_reference_link=true – trims payload size
+        - sysparm_fields           – fetches only schema-selected columns
+
+        Used primarily by FullTableStream.  IncrementalStream.sync() has its
+        own inline loop that combines the compound watermark with keyset
+        pagination into a single cursor.
+        """
+        page_size = self.page_size or 1000
+        last_sys_id: str = ""
+        has_more: bool = True
+
+        # Build field selection from the schema defined on this stream
+        fields: str = ",".join(self.schema.get("properties", {}).keys()) or ""
+
+        while has_more:
+            try:
+                paginated_params = self.params.copy()
+
+                # Keyset clause appended to whatever base query was set externally
+                base_query = paginated_params.get("sysparm_query", "")
+                if last_sys_id:
+                    keyset = f"sys_id>{last_sys_id}"
+                    paginated_params["sysparm_query"] = (
+                        f"{base_query}^{keyset}^ORDERBYsys_id"
+                        if base_query
+                        else f"{keyset}^ORDERBYsys_id"
+                    )
+                else:
+                    paginated_params["sysparm_query"] = (
+                        f"{base_query}^ORDERBYsys_id" if base_query else "ORDERBYsys_id"
+                    )
+
+                # Remove offset key if it was added by legacy code
+                paginated_params.pop("sysparm_offset", None)
+
+                # Performance params
+                paginated_params["sysparm_limit"] = page_size
+                paginated_params["sysparm_no_count"] = "true"
+                paginated_params["sysparm_exclude_reference_link"] = "true"
+                if fields:
+                    paginated_params["sysparm_fields"] = fields
+
+                response = self.client.make_request(
+                    self.http_method,
+                    self.url_endpoint,
+                    paginated_params,
+                    self.headers,
+                    body=json.dumps(self.data_payload),
+                    path=self.path,
+                )
+                raw_records = response.get(self.data_key, [])
+
+                for record in raw_records:
+                    if record:  # skip empty {} records
+                        last_sys_id = record.get("sys_id", last_sys_id)
+                        yield record
+
+                has_more = len(raw_records) == page_size
+
+            except ServiceNowForbiddenError as e:
+                LOGGER.critical("403 Forbidden on %s: %s", self.url_endpoint, e)
+                has_more = False
+
+            except Exception as e:
+                LOGGER.error("Unexpected error while fetching records: %s", e)
+                raise
+
+
+    def write_schema(self) -> None:
+        """
+        Write a schema message.
+        """
+        try:
+            write_schema(self.tap_stream_id, self.schema, self.key_properties)
+        except OSError as err:
+            LOGGER.error(
+                "OS Error while writing schema for: {}".format(self.tap_stream_id)
+            )
+            raise err
+
+    def update_params(self, **kwargs) -> None:
+        """
+        Update params for the stream
+        """
+        self.params.update(kwargs)
+
+    def update_data_payload(self, **kwargs) -> None:
+        """
+        Update JSON body for the stream
+        """
+        self.data_payload.update(kwargs)
+
+    def modify_object(self, record: Dict, parent_record: Dict = None) -> Dict:
+        """
+        Modify the record before writing to the stream
+        """
+        return record
+
+    def get_url_endpoint(self, parent_obj: Dict = None) -> str:
+        """
+        Get the URL endpoint for the stream
+        """
+        return self.url_endpoint or f"{self.client.base_url}/{self.path}"
+
+
+class IncrementalStream(BaseStream):
+    """Base Class for Incremental Stream."""
+
+
+    def get_bookmark(self, state: dict, stream: str, key: Any = None) -> int:
+        """A wrapper for singer.get_bookmark to deal with compatibility for
+        bookmark values or start values."""
+        return get_bookmark(
+            state,
+            stream,
+            key or self.replication_keys[0],
+            self.client.config["start_date"],
+        )
+
+    def write_bookmark(self, state: dict, stream: str, key: Any = None, value: Any = None) -> Dict:
+        """A wrapper for singer.get_bookmark to deal with compatibility for
+        bookmark values or start values."""
+        if not (key or self.replication_keys):
+            return state
+
+        current_bookmark = get_bookmark(state, stream, key or self.replication_keys[0], self.client.config["start_date"])
+        value = max(current_bookmark, value)
+        return write_bookmark(
+            state, stream, key or self.replication_keys[0], value
+        )
+
+
+    def sync(
+        self,
+        state: Dict,
+        transformer: Transformer,
+        parent_obj: Dict = None,
+    ) -> Dict:
+        """
+        Incremental sync using a sys_updated_on bookmark combined with keyset
+        pagination.  The query always uses >= so the bookmark row may be
+        re-read on the next sync.
+        """
+        replication_key = self.replication_keys[0] if self.replication_keys else "sys_updated_on"
+
+        # --- Retrieve bookmark --------------------------------------------
+        bookmark_dt: str = _to_snow_dt(self.get_bookmark(state, self.tap_stream_id))
+        current_max_dt: str = bookmark_dt
+
+        page_size: int = self.page_size or 1000
+        self.url_endpoint = self.get_url_endpoint(parent_obj)
+        if parent_obj:
+            self.update_data_payload(**parent_obj)
+
+        # Field selection derived from the stream's schema
+        fields: str = ",".join(self.schema.get("properties", {}).keys()) or ""
+
+        with metrics.record_counter(self.tap_stream_id) as counter:
+            empty_record_count = 0
+            # Keyset cursor: track the last (sys_updated_on, sys_id) seen so we
+            # can advance the query on every page without using offset pagination.
+            last_page_dt: str = ""
+            last_page_sid: str = ""
+            has_more: bool = True
+            try:
+                while has_more:
+                    if last_page_dt and last_page_sid:
+                        query = (
+                            f"{replication_key}>={bookmark_dt}"
+                            f"^{replication_key}>{last_page_dt}"
+                            f"^NQ{replication_key}>={bookmark_dt}"
+                            f"^{replication_key}={last_page_dt}"
+                            f"^sys_id>{last_page_sid}"
+                            f"^ORDERBY{replication_key}^ORDERBYsys_id"
+                        )
+                    else:
+                        query = (
+                            f"{replication_key}>={bookmark_dt}"
+                            f"^ORDERBY{replication_key}^ORDERBYsys_id"
+                        )
+
+                    params: Dict = {
+                        "sysparm_query": query,
+                        "sysparm_limit": page_size,
+                        "sysparm_no_count": "true",
+                        "sysparm_exclude_reference_link": "true",
+                    }
+                    if fields:
+                        params["sysparm_fields"] = fields
+
+                    try:
+                        response = self.client.make_request(
+                            self.http_method,
+                            self.url_endpoint,
+                            params,
+                            self.headers,
+                            body=json.dumps(self.data_payload),
+                            path=self.path,
+                        )
+                    except ServiceNowForbiddenError as e:
+                        LOGGER.critical("403 Forbidden on %s: %s", self.url_endpoint, e)
+                        break
+
+                    raw_records = response.get(self.data_key, [])
+
+                    for record in raw_records:
+                        if isinstance(record, dict) and not record:
+                            empty_record_count += 1
+                            continue
+
+                        record = self.modify_object(record, parent_obj)
+
+                        record_dt: str = _to_snow_dt(record.get(replication_key) or bookmark_dt)
+                        record_sid: str = record.get("sys_id", "")
+
+                        # Advance the keyset cursor to the last record on this page
+                        last_page_dt = record_dt
+                        last_page_sid = record_sid
+
+                        if record_dt >= bookmark_dt:
+                            transformed_record = transformer.transform(
+                                record, self.schema, self.metadata
+                            )
+                            if self.is_selected():
+                                write_record(self.tap_stream_id, transformed_record)
+                                counter.increment()
+
+                            # Only advance bookmark for records that were actually emitted
+                            if record_dt > current_max_dt:
+                                current_max_dt = record_dt
+
+                            for child in self.child_to_sync:
+                                child.sync(
+                                    state=state,
+                                    transformer=transformer,
+                                    parent_obj=record,
+                                )
+
+                    has_more = len(raw_records) == page_size
+
+                state = write_bookmark(
+                    state, self.tap_stream_id, replication_key, current_max_dt
+                )
+                singer.write_state(state)
+
+                if empty_record_count > 0:
+                    LOGGER.warning(
+                        "Stream '%s' encountered %d empty records "
+                        "(possibly due to missing data-level permissions).",
+                        self.tap_stream_id, empty_record_count
+                    )
+                return counter.value
+
+            except ServiceNowError as e:
+                # A ServiceNow API error that exhausted retries or is non-retryable
+                # (e.g. 403 Forbidden). Log and skip this stream gracefully.
+                LOGGER.critical("Skipping stream '%s' due to: %s", self.tap_stream_id, e)
+                return 0
+
+
+class FullTableStream(BaseStream):
+    """Base Class for Incremental Stream."""
+
+    replication_keys = []
+
+    def sync(
+        self,
+        state: Dict,
+        transformer: Transformer,
+        parent_obj: Dict = None,
+    ) -> Dict:
+        """Abstract implementation for `type: Fulltable` stream."""
+        self.url_endpoint = self.get_url_endpoint(parent_obj)
+        with metrics.record_counter(self.tap_stream_id) as counter:
+            for record in self.get_records():
+                transformed_record = transformer.transform(
+                    record, self.schema, self.metadata
+                )
+                if self.is_selected():
+                    write_record(self.tap_stream_id, transformed_record)
+                    counter.increment()
+
+                for child in self.child_to_sync:
+                    child.sync(state=state, transformer=transformer, parent_obj=record)
+
+            return counter.value
+
+
+class ParentBaseStream(IncrementalStream):
+    """Base Class for Parent Stream."""
+
+    def get_bookmark(self, state: Dict, stream: str, key: Any = None) -> int:
+        """A wrapper for singer.get_bookmark to deal with compatibility for
+        bookmark values or start values."""
+
+        min_parent_bookmark = (
+            super().get_bookmark(state, stream) if self.is_selected() else None
+        )
+        for child in self.child_to_sync:
+            bookmark_key = f"{self.tap_stream_id}_{self.replication_keys[0]}"
+            child_bookmark = super().get_bookmark(
+                state, child.tap_stream_id, key=bookmark_key
+            )
+            min_parent_bookmark = (
+                min(min_parent_bookmark, child_bookmark)
+                if min_parent_bookmark
+                else child_bookmark
+            )
+
+        return min_parent_bookmark
+
+    def write_bookmark(
+        self, state: Dict, stream: str, key: Any = None, value: Any = None
+    ) -> Dict:
+        """A wrapper for singer.get_bookmark to deal with compatibility for
+        bookmark values or start values."""
+        if self.is_selected():
+            super().write_bookmark(state, stream, value=value)
+
+        for child in self.child_to_sync:
+            bookmark_key = f"{self.tap_stream_id}_{self.replication_keys[0]}"
+            super().write_bookmark(
+                state, child.tap_stream_id, key=bookmark_key, value=value
+            )
+
+        return state
