@@ -228,7 +228,11 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
                     table,
                 )
 
-            schema = {"type": "object", "properties": properties}
+            schema = {
+                "type": "object",
+                "properties": properties,
+                "additionalProperties": False
+            }
 
             # Lightweight access probe (1 record, no count)
             try:

@@ -1,2 +1,4 @@
+# Changelog
 
-  * Initial Commit
+## 0.0.1
+  * Initial commit
