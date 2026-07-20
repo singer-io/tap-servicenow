@@ -44,6 +44,28 @@ def wait_if_retry_after(details):
     if hasattr(exc, 'retry_after') and exc.retry_after is not None:
         time.sleep(exc.retry_after)  # Force exact wait
 
+
+# Shared retry policy for ALL outbound requests. Retries transient failures
+# (connection resets, timeouts) and ServiceNowBackoffError (429 / 5xx, which
+# carries Retry-After). 401/403/404 are intentionally absent, so they raise
+# immediately for the caller to handle. Both make_request() and the get() access
+# probe use this - previously get() had no retry, so a single 429 during
+# discovery silently dropped a table the account could actually read.
+RETRY_ON_TRANSIENT = backoff.on_exception(
+    wait_gen=backoff.expo,
+    factor=2,
+    on_backoff=wait_if_retry_after,
+    exception=(
+        ConnectionResetError,
+        ConnectionError,
+        ChunkedEncodingError,
+        Timeout,
+        ServiceNowBackoffError,  # covers ServiceNowRateLimitError via inheritance
+    ),
+    max_tries=5,
+)
+
+
 class Client:
     """
     A Wrapper class.
@@ -78,19 +100,22 @@ class Client:
             self.config["password"]
         )
         return headers, params
-    
+
+    @RETRY_ON_TRANSIENT
     def get(
         self,
         table: str,
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Lightweight access probe: raises ServiceNowError subclass on 4xx/5xx.
+        """Per-table read-access probe: raises a ServiceNowError subclass on 4xx/5xx.
 
         Routes through raise_for_error so callers receive typed exceptions
-        (e.g. ServiceNowForbiddenError) rather than raw status codes.
-        Callers that need to detect permission issues should catch
-        ServiceNowForbiddenError / ServiceNowUnauthorizedError.
+        (e.g. ServiceNowForbiddenError) rather than raw status codes. The shared
+        RETRY_ON_TRANSIENT policy retries 429/5xx (honoring Retry-After) so a
+        transient rate-limit during the discovery probe does NOT wrongly drop a
+        table the account can actually read; 401/403/404 raise immediately for
+        the caller to classify.
         """
         params = params or {}
         headers = headers or {}
@@ -124,19 +149,7 @@ class Client:
             timeout=self.request_timeout
         )
 
-    @backoff.on_exception(
-        wait_gen=backoff.expo,
-        factor=2,
-        on_backoff=wait_if_retry_after,
-        exception=(
-            ConnectionResetError,
-            ConnectionError,
-            ChunkedEncodingError,
-            Timeout,
-            ServiceNowBackoffError,  # covers ServiceNowRateLimitError via inheritance
-        ),
-        max_tries=5,
-    )
+    @RETRY_ON_TRANSIENT
     def __make_request(
         self, method: str, endpoint: str, **kwargs
     ) -> Optional[Mapping[Any, Any]]:

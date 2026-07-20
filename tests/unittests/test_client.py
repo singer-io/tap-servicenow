@@ -12,6 +12,8 @@ default_config = {
     "base_url": "https://api.example.com",
     "request_timeout": 30,
     "auth_token": "dummy_token",
+    "user": "mock-user",
+    "password": "mock-pass",
 }
 
 DEFAULT_REQUEST_TIMEOUT = 300
@@ -115,5 +117,33 @@ class TestClient(unittest.TestCase):
         with patch.object(self.client._session, "request", side_effect=error) as mock_request:
             with self.assertRaises(error) as e:
                 self.client._Client__make_request("GET", "https://api.example.com/resource")
-            
+
             self.assertEqual(mock_request.call_count, 5)
+
+    # --- Access-probe (client.get) retry policy -------------------------------
+    # get() is the per-table discovery probe. Without retry, a single transient
+    # 429 during discovery would silently drop a table the account can read.
+
+    @patch("time.sleep")
+    def test_get_probe_retries_then_succeeds_on_429(self, mock_sleep):
+        """A transient 429 on the probe is retried, not treated as no-access."""
+        responses = [MockResponse(429, headers={"Retry-After": "1"}), MockResponse(200)]
+        with patch.object(self.client._session, "get", side_effect=responses) as mock_get:
+            self.client.get("incident")  # must not raise
+            self.assertEqual(mock_get.call_count, 2)
+
+    @patch("time.sleep")
+    def test_get_probe_retries_5x_on_persistent_429(self, mock_sleep):
+        with patch.object(self.client._session, "get",
+                          return_value=MockResponse(429, headers={"Retry-After": "1"})) as mock_get:
+            with self.assertRaises(ServiceNowRateLimitError):
+                self.client.get("incident")
+            self.assertEqual(mock_get.call_count, 5)
+
+    def test_get_probe_403_not_retried(self):
+        """403 is a real permission answer - raise immediately, do not retry."""
+        with patch.object(self.client._session, "get",
+                          return_value=MockResponse(403)) as mock_get:
+            with self.assertRaises(ServiceNowForbiddenError):
+                self.client.get("incident")
+            self.assertEqual(mock_get.call_count, 1)
