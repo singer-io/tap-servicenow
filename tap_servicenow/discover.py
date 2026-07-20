@@ -1,9 +1,7 @@
-from typing import Dict
 import singer
 from singer import metadata
 from singer.catalog import Catalog, CatalogEntry, Schema
 from tap_servicenow.schema import get_dynamic_schema
-from tap_servicenow.client import Client
 
 LOGGER = singer.get_logger()
 
