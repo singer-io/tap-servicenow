@@ -307,7 +307,10 @@ class TestIncrementalSync(unittest.TestCase):
 class TestGetRecordsKeyset(unittest.TestCase):
 
     def _stream(self, pages):
-        client = _make_client([{"result": p} for p in pages])
+        # Trailing empty page: keyset pagination past the end of a table returns
+        # an empty result set, which is the correct stop signal. A short page is
+        # not, because row-level ACLs shrink pages after the query runs.
+        client = _make_client([{"result": p} for p in pages] + [{"result": []}])
         stream = ConcreteBase(client, _make_catalog())
         stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
         return stream, client
@@ -367,12 +370,27 @@ class TestGetRecordsKeyset(unittest.TestCase):
         self.assertNotIn({}, result)
         self.assertEqual(len(result), 1)
 
-    def test_stops_on_partial_page(self):
-        page1 = [_record(f"id-{i}", "2024-01-01T00:00:00Z") for i in range(5)]
-        page2 = [_record("id-end", "2024-01-02T00:00:00Z")]  # partial
+    def test_short_page_does_not_stop(self):
+        """
+        Regression: ServiceNow returns short pages when row-level ACLs filter
+        rows post-query. A short page must NOT end pagination or the table is
+        silently truncated. Both pages here are shorter than page_size, yet all
+        rows must be returned.
+        """
+        page1 = [_record(f"id-{i}", "2024-01-01T00:00:00Z") for i in range(3)]  # < page_size
+        page2 = [_record("id-end", "2024-01-02T00:00:00Z")]
         stream, client = self._stream([page1, page2])
         stream.page_size = 5
+        result = list(stream.get_records())
+        self.assertEqual(len(result), 4)
+
+    def test_stops_on_empty_page(self):
+        """get_records stops on the first empty page, not on a short one."""
+        page1 = [_record(f"id-{i}", "2024-01-01T00:00:00Z") for i in range(5)]
+        stream, client = self._stream([page1])   # _stream appends the empty page
+        stream.page_size = 5
         list(stream.get_records())
+        # One data page + the terminal empty page.
         self.assertEqual(client.make_request.call_count, 2)
 
     def test_orderby_sys_id_in_query(self):
@@ -381,6 +399,53 @@ class TestGetRecordsKeyset(unittest.TestCase):
         list(stream.get_records())
         params = client.make_request.call_args_list[0][0][2]
         self.assertIn("ORDERBYsys_id", params["sysparm_query"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# BaseStream.selected_fields — catalog field selection drives sysparm_fields
+# ---------------------------------------------------------------------------
+
+class TestSelectedFields(unittest.TestCase):
+    """A deselected field must not be requested from ServiceNow; keys/replication
+    keys are always retained; unspecified fields default to selected."""
+
+    def _base(self, props, mdata):
+        s = ConcreteBase(MagicMock(), None)
+        s.schema = {"type": "object", "properties": {p: {} for p in props}}
+        s.metadata = mdata
+        return s
+
+    def test_deselected_and_unsupported_fields_excluded(self):
+        mdata = {
+            ("properties", "sys_id"): {"inclusion": "automatic"},
+            ("properties", "a"): {"inclusion": "available", "selected": True},
+            ("properties", "b"): {"inclusion": "available", "selected": False},
+            ("properties", "c"): {"inclusion": "unsupported"},
+        }
+        fields = self._base(["sys_id", "a", "b", "c"], mdata).selected_fields().split(",")
+        self.assertIn("a", fields)
+        self.assertIn("sys_id", fields)
+        self.assertNotIn("b", fields)   # explicitly deselected -> not fetched
+        self.assertNotIn("c", fields)   # unsupported -> not fetched
+
+    def test_key_property_always_kept(self):
+        mdata = {("properties", "sys_id"): {"inclusion": "available", "selected": False}}
+        fields = self._base(["sys_id", "a"], mdata).selected_fields().split(",")
+        self.assertIn("sys_id", fields)   # key retained for keyset pagination
+
+    def test_replication_key_always_kept(self):
+        s = ConcreteIncremental(MagicMock(), None)
+        s.schema = {"type": "object", "properties": {"sys_id": {}, "sys_updated_on": {}, "a": {}}}
+        s.metadata = {("properties", "sys_updated_on"): {"inclusion": "available", "selected": False}}
+        self.assertIn("sys_updated_on", s.selected_fields().split(","))  # bookmark field retained
+
+    def test_no_metadata_selects_all(self):
+        fields = self._base(["sys_id", "a", "b"], {}).selected_fields().split(",")
+        self.assertEqual(set(fields), {"sys_id", "a", "b"})
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch, call
 
 from tap_servicenow.schema import get_dynamic_schema
 from tap_servicenow.streams import DEFAULT_EXCLUDED_TABLES
+from tap_servicenow.concurrent_discovery import ServiceNowDictionaryFetcher
 from tap_servicenow.exceptions import ServiceNowForbiddenError, ServiceNowUnauthorizedError
 
 
@@ -459,6 +460,43 @@ class TestMetadataOutput(unittest.TestCase):
         mmap = sm.to_map(meta["incident"])
         key_props = sm.get(mmap, (), "table-key-properties")
         self.assertEqual(key_props, ["sys_id"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# sys_dictionary fetch pagination (ServiceNowDictionaryFetcher.process_item)
+# ---------------------------------------------------------------------------
+
+class TestDictionaryFetcherPagination(unittest.TestCase):
+    """A chunk with more dictionary rows than the page limit must not lose fields."""
+
+    def _client(self, pages):
+        c = MagicMock()
+        c.base_url = "https://test.service-now.com/api/now/table"
+        c.make_request.side_effect = [{"result": p} for p in pages]
+        return c
+
+    def test_paginates_past_the_page_limit(self):
+        # dict_page_size=2: page1 is full (==limit) -> keep going; page2 is short -> stop
+        page1 = [{"name": "t1", "element": "f1", "internal_type": "string", "sys_id": "s1"},
+                 {"name": "t1", "element": "f2", "internal_type": "string", "sys_id": "s2"}]
+        page2 = [{"name": "t1", "element": "f3", "internal_type": "string", "sys_id": "s3"}]
+        client = self._client([page1, page2])
+        fetcher = ServiceNowDictionaryFetcher(client, dict_page_size=2)
+        result = fetcher.process_item(["t1"])
+        self.assertEqual(set(result["t1"].keys()), {"f1", "f2", "f3"})
+        self.assertEqual(client.make_request.call_count, 2)
+
+    def test_single_short_page_stops_immediately(self):
+        page1 = [{"name": "t1", "element": "f1", "internal_type": "string", "sys_id": "s1"}]
+        client = self._client([page1])
+        fetcher = ServiceNowDictionaryFetcher(client, dict_page_size=50)
+        result = fetcher.process_item(["t1"])
+        self.assertEqual(result, {"t1": {"f1": {"type": ["string", "null"]}}})
+        self.assertEqual(client.make_request.call_count, 1)
 
 
 if __name__ == "__main__":

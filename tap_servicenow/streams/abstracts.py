@@ -13,7 +13,6 @@ from singer import (
     metadata
 )
 
-import time
 from datetime import timezone
 import dateutil.parser
 from tap_servicenow.exceptions import ServiceNowError, ServiceNowForbiddenError
@@ -145,7 +144,7 @@ class BaseStream(ABC):
         has_more: bool = True
 
         # Build field selection from the schema defined on this stream
-        fields: str = ",".join(self.schema.get("properties", {}).keys()) or ""
+        fields: str = self.selected_fields()
 
         while has_more:
             try:
@@ -184,13 +183,19 @@ class BaseStream(ABC):
                     path=self.path,
                 )
                 raw_records = response.get(self.data_key, [])
+                prev_sys_id = last_sys_id
 
                 for record in raw_records:
                     if record:  # skip empty {} records
                         last_sys_id = record.get("sys_id", last_sys_id)
                         yield record
 
-                has_more = len(raw_records) == page_size
+                # Row-level ACLs are applied after the query, so a short page is
+                # expected and does NOT mean end-of-data (ServiceNow KB0727636).
+                # Stop only on an empty page; without this, any ACL-filtered short
+                # page silently truncates the table. The cursor-advance check
+                # guards against an all-empty page looping forever.
+                has_more = bool(raw_records) and last_sys_id != prev_sys_id
 
             except ServiceNowForbiddenError as e:
                 LOGGER.critical("403 Forbidden on %s: %s", self.url_endpoint, e)
@@ -236,6 +241,33 @@ class BaseStream(ABC):
         Get the URL endpoint for the stream
         """
         return self.url_endpoint or f"{self.client.base_url}/{self.path}"
+
+    def selected_fields(self) -> str:
+        """Comma-separated `sysparm_fields` value honoring catalog field selection.
+
+        A deselected field is not requested from ServiceNow at all, instead of
+        being fetched over the wire and dropped only at output. This mirrors how
+        the database taps build their column list (desired_columns /
+        should_sync_column) and is the one per-record payload lever the API
+        offers. Key and replication-key fields are always retained so keyset
+        pagination and bookmarking keep working; `automatic` and unspecified
+        fields default to selected (matching should_sync_field default=True).
+        """
+        props = list(self.schema.get("properties", {}).keys())
+        selected = []
+        for field in props:
+            breadcrumb = ("properties", field)
+            inclusion = metadata.get(self.metadata, breadcrumb, "inclusion")
+            is_selected = metadata.get(self.metadata, breadcrumb, "selected")
+            if inclusion == "unsupported":
+                continue
+            if inclusion == "automatic" or is_selected is not False:
+                selected.append(field)
+        # Always keep the keyset cursor and replication key regardless of selection.
+        for required in list(self.key_properties or []) + list(self.replication_keys or []):
+            if required and required in props and required not in selected:
+                selected.append(required)
+        return ",".join(selected)
 
 
 class IncrementalStream(BaseStream):
@@ -288,7 +320,7 @@ class IncrementalStream(BaseStream):
             self.update_data_payload(**parent_obj)
 
         # Field selection derived from the stream's schema
-        fields: str = ",".join(self.schema.get("properties", {}).keys()) or ""
+        fields: str = self.selected_fields()
 
         with metrics.record_counter(self.tap_stream_id) as counter:
             empty_record_count = 0
@@ -337,6 +369,7 @@ class IncrementalStream(BaseStream):
                         break
 
                     raw_records = response.get(self.data_key, [])
+                    prev_page_dt, prev_page_sid = last_page_dt, last_page_sid
 
                     for record in raw_records:
                         if isinstance(record, dict) and not record:
@@ -371,7 +404,15 @@ class IncrementalStream(BaseStream):
                                     parent_obj=record,
                                 )
 
-                    has_more = len(raw_records) == page_size
+                    # Short pages are expected under ServiceNow row-level ACLs and
+                    # do NOT signal end-of-data (KB0727636); only an empty page
+                    # does. Stopping on a short page here silently drops records
+                    # the bookmark then skips over. The cursor-advance check
+                    # prevents an infinite loop on a page that yields no
+                    # advanceable (sys_updated_on, sys_id).
+                    has_more = bool(raw_records) and (
+                        last_page_dt != prev_page_dt or last_page_sid != prev_page_sid
+                    )
 
                 state = write_bookmark(
                     state, self.tap_stream_id, replication_key, current_max_dt

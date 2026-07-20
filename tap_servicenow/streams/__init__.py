@@ -59,6 +59,7 @@ def get_all_tables(client, page_size: int = 500) -> Dict[str, str]:
         )
 
         records = response.get("result", [])
+        prev_sys_id = last_sys_id
 
         for r in records:
             name = r.get("name") or ""
@@ -73,8 +74,14 @@ def get_all_tables(client, page_size: int = 500) -> Dict[str, str]:
             if sys_id:
                 last_sys_id = sys_id
 
-        # Continue only if a full page was returned — partial page means last page
-        has_more = len(records) == page_size
+        # ServiceNow evaluates row-level ACLs AFTER the query runs, so a page can
+        # come back with fewer than page_size rows even when more tables remain.
+        # A short page is therefore NOT the last page (ServiceNow KB0727636);
+        # only an empty page is. Stopping on the first short page is what
+        # truncated discovery to a single page of sys_db_object. The last_sys_id
+        # advance check stops the loop if a page yields no usable keyset cursor,
+        # preventing an infinite loop.
+        has_more = bool(records) and last_sys_id != prev_sys_id
 
     return table_map
 

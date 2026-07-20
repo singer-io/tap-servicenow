@@ -71,39 +71,62 @@ class ServiceNowDictionaryFetcher(ConcurrentDiscovery):
         self.dict_page_size = dict_page_size
 
     def process_item(self, chunk: List[str]) -> Optional[Dict[str, Dict]]:
-        """Query sys_dictionary for one batch of ServiceNow tables. Returns {table: {field: type}}."""
-        names_in = ",".join(chunk)
-        params = {
-            "sysparm_query": f"nameIN{names_in}",
-            "sysparm_fields": "name,element,internal_type",
-            "sysparm_limit": self.dict_page_size,
-            "sysparm_no_count": "true",
-            "sysparm_exclude_reference_link": "true",
-        }
-        try:
-            response = self.client.make_request(
-                method="GET",
-                endpoint=f"{self.client.base_url}/sys_dictionary",
-                params=params,
-            )
-        except Exception as exc:
-            LOGGER.warning(
-                "sys_dictionary batch query failed for chunk starting %r: %s",
-                chunk[:3],
-                exc,
-            )
-            return None
+        """Query sys_dictionary for one batch of ServiceNow tables. Returns {table: {field: type}}.
 
+        Keyset-paginates by sys_id: a single fixed-limit request silently drops
+        fields for any chunk whose dictionary rows exceed the limit, which would
+        leave those tables with incomplete (or empty) schemas.
+        """
+        names_in = ",".join(chunk)
+        base_query = f"nameIN{names_in}"
         partial: Dict[str, Dict] = {}
-        for field in response.get("result", []):
-            tbl   = field.get("name") or ""
-            elem  = field.get("element") or ""
-            stype = field.get("internal_type") or ""
-            if isinstance(stype, dict):
-                stype = stype.get("value") or ""
-            if not tbl or not elem or not stype:
-                continue
-            partial.setdefault(tbl, {})[elem] = servicenow_type_to_json_type(stype)
+        last_sys_id = ""
+        while True:
+            query = (
+                f"{base_query}^sys_id>{last_sys_id}^ORDERBYsys_id"
+                if last_sys_id else f"{base_query}^ORDERBYsys_id"
+            )
+            params = {
+                "sysparm_query": query,
+                "sysparm_fields": "name,element,internal_type,sys_id",
+                "sysparm_limit": self.dict_page_size,
+                "sysparm_no_count": "true",
+                "sysparm_exclude_reference_link": "true",
+            }
+            try:
+                response = self.client.make_request(
+                    method="GET",
+                    endpoint=f"{self.client.base_url}/sys_dictionary",
+                    params=params,
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "sys_dictionary batch query failed for chunk starting %r: %s",
+                    chunk[:3],
+                    exc,
+                )
+                return partial or None
+
+            rows = response.get("result", [])
+            prev_sys_id = last_sys_id
+            for field in rows:
+                sid = field.get("sys_id") or ""
+                if sid:
+                    last_sys_id = sid
+                tbl   = field.get("name") or ""
+                elem  = field.get("element") or ""
+                stype = field.get("internal_type") or ""
+                if isinstance(stype, dict):
+                    stype = stype.get("value") or ""
+                if not tbl or not elem or not stype:
+                    continue
+                partial.setdefault(tbl, {})[elem] = servicenow_type_to_json_type(stype)
+
+            # Fetch another page only if we filled this one (may be more rows);
+            # a partial page means the chunk is exhausted. The cursor-stall check
+            # prevents an infinite loop if a page carries no advanceable sys_id.
+            if len(rows) < self.dict_page_size or last_sys_id == prev_sys_id:
+                break
         return partial
 
     def fetch(
@@ -137,8 +160,13 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
     """Builds the Singer catalog schema and metadata for each ServiceNow table in parallel.
 
     Resolves inherited fields by walking the super_class chain, then runs a
-    lightweight API access probe per table. Unauthorized tables are collected
-    in self.unauthorized_tables after build() completes.
+    per-table read-access probe. Tables the account cannot read are collected in
+    self.unauthorized_tables and dropped from the catalog so the QTC selection UI
+    only offers readable streams. This is deliberately different from the database
+    taps: ServiceNow's metadata (sys_db_object) lists tables whose DATA the account
+    cannot read - unlike a database's information_schema - so listing everything
+    would flood the picker with unusable streams. The probe uses the client's
+    shared retry policy so a transient 429 does not drop a readable table.
     """
 
     def __init__(
@@ -234,7 +262,11 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
                 "additionalProperties": False
             }
 
-            # Lightweight access probe (1 record, no count)
+            # Per-table read-access probe. ServiceNow lists tables in sys_db_object
+            # whose DATA the account cannot read, so unreadable tables are dropped
+            # here to keep the QTC selection UI to readable streams. client.get's
+            # shared retry policy means a transient 429 retries rather than
+            # wrongly dropping a readable table.
             try:
                 self.client.get(
                     table=table,
