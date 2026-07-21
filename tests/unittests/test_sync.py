@@ -247,3 +247,26 @@ class TestSyncPermissionErrorIsolation(unittest.TestCase):
 
         # Aborted on the first stream rather than continuing.
         self.assertEqual(mock_sync.call_count, 1) 
+
+
+class TestSchemaErroredTableReporting(unittest.TestCase):
+    """schema.py must distinguish 'no access' from 'failed this run'."""
+
+    def test_errored_tables_are_reported_as_errors(self):
+        from tap_servicenow import schema as schema_mod
+
+        builder = MagicMock()
+        builder.build.return_value = ({}, {})
+        builder.unauthorized_tables = []
+        builder.errored_tables = [("incident", "503 after retries")]
+
+        with patch.object(schema_mod, "ServiceNowTableSchemaBuilder", return_value=builder), \
+             patch.object(schema_mod, "ServiceNowDictionaryFetcher") as fetcher, \
+             patch.object(schema_mod, "get_all_tables", return_value={"incident": ""}), \
+             patch.object(schema_mod, "LOGGER") as mock_log:
+            fetcher.return_value.fetch.return_value = {"incident": {}}
+            schema_mod.get_dynamic_schema(MagicMock())
+
+        messages = " ".join(str(c) for c in mock_log.error.call_args_list)
+        self.assertIn("incident", messages)
+        self.assertIn("not permissions", messages.replace("not\npermissions", "not permissions"))

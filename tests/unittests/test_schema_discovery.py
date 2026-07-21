@@ -7,6 +7,7 @@ Unit tests for:
       - deferred 401/403 unauthorised-table summary logging
       - performance params on access-check requests
 """
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
@@ -20,6 +21,7 @@ from tap_servicenow.concurrent_discovery import (
 )
 from tap_servicenow.exceptions import (
     ServiceNowForbiddenError,
+    ServiceNowIncompleteSyncError,
     ServiceNowServiceUnavailableError,
 )
 
@@ -615,15 +617,54 @@ class TestResolveFieldsConcurrency(unittest.TestCase):
             MagicMock(), field_map, table_map, max_workers=4
         )
 
-    def test_cyclic_chain_does_not_deadlock(self):
+    def test_resolve_fields_takes_no_locks(self):
+        """The structural guarantee, asserted directly.
+
+        The previous test submitted 4 tasks over a 2-node cycle and hoped the
+        ABBA interleave occurred. It does not occur reliably, so that test
+        passed against the pre-fix implementation verbatim - it verified
+        nothing. A deadlock is a race; the absence of lock acquisition during
+        the walk is not, so assert that instead.
+        """
         builder = self._builder({"A": "B", "B": "A"},
                                 {"A": {"f_a": {}}, "B": {"f_b": {}}})
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = [pool.submit(builder._resolve_fields, t)
-                       for t in ["A", "B", "A", "B"]]
-            # A deadlock shows up as TimeoutError here rather than a hang.
-            results = [f.result(timeout=10) for f in futures]
-        self.assertTrue(all(r for r in results))
+
+        real_lock = builder._cache_lock
+        acquisitions = []
+
+        class WatchedLock:
+            def __enter__(self):
+                acquisitions.append(len(acquisitions))
+                return real_lock.__enter__()
+            def __exit__(self, *a):
+                return real_lock.__exit__(*a)
+
+        builder._cache_lock = WatchedLock()
+        builder._resolve_fields("A")
+
+        # The walk itself must hold no lock. Only the cache read and the cache
+        # write may, and neither happens while recursing - because there is no
+        # recursion any more.
+        self.assertLessEqual(
+            len(acquisitions), 2,
+            "the inheritance walk must not acquire locks per chain hop; "
+            "holding a lock across the walk is what deadlocked",
+        )
+        self.assertFalse(
+            hasattr(builder, "_key_locks"),
+            "per-table locks were the deadlock mechanism and must be gone",
+        )
+
+    def test_cyclic_chain_completes_under_forced_contention(self):
+        """Many threads over a cycle must all finish, repeatedly."""
+        for _ in range(25):
+            builder = self._builder({"A": "B", "B": "A"},
+                                    {"A": {"f_a": {}}, "B": {"f_b": {}}})
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(builder._resolve_fields, t)
+                           for t in ["A", "B"] * 8]
+                results = [f.result(timeout=5) for f in futures]
+            self.assertTrue(all(r for r in results))
 
     def test_cyclic_chain_is_deterministic(self):
         """A cycle used to yield different schemas depending on cache order."""
@@ -688,3 +729,85 @@ class TestErroredVsUnauthorizedTables(unittest.TestCase):
         self.assertEqual(builder.unauthorized_tables, [],
                          "a 503 is not a permission answer")
         self.assertEqual([t for t, _ in builder.errored_tables], ["incident"])
+
+
+class TestUnverifiedGuards(unittest.TestCase):
+    """Coverage for fixes that mutation testing showed were unverified.
+
+    Each of these survived having its implementation reverted while the suite
+    stayed green, which means no test would have caught the regression.
+    """
+
+    def test_fail_fast_cancels_queued_futures(self):
+        """FAIL_FAST must not drain the queue before aborting.
+
+        The raise sits inside `with ThreadPoolExecutor(...)`, whose __exit__
+        calls shutdown(wait=True), so without explicit cancellation the abort
+        still works through every queued item first.
+        """
+        started = []
+
+        class Phase(ConcurrentDiscovery):
+            FAIL_FAST = True
+
+            def process_item(self, item):
+                started.append(item)
+                if item == 0:
+                    raise ServiceNowForbiddenError("boom")
+                # Real items perform HTTP requests. With instant items the
+                # single worker drains the whole queue before the main thread
+                # observes the failure, and cancellation cannot help anything.
+                time.sleep(0.02)
+                return item
+
+        phase = Phase(max_workers=1)   # serial, so ordering is deterministic
+        with self.assertRaises(ServiceNowForbiddenError):
+            phase.run(list(range(50)))
+
+        self.assertLess(
+            len(started), 50,
+            "queued items must be cancelled on abort, not all executed",
+        )
+
+    def test_fail_fast_false_does_not_cancel(self):
+        """The non-fail-fast phase must still process everything."""
+        started = []
+
+        class Phase(ConcurrentDiscovery):
+            FAIL_FAST = False
+
+            def process_item(self, item):
+                started.append(item)
+                if item == 0:
+                    raise ServiceNowForbiddenError("boom")
+                return item
+
+        results = Phase(max_workers=1).run(list(range(20)))
+        self.assertEqual(len(started), 20)
+        self.assertEqual(len(results), 19)   # all but the raising one
+
+    def test_dictionary_stall_raises_on_a_full_page(self):
+        """A FULL page that cannot advance the cursor means rows remain."""
+        client = MagicMock()
+        client.base_url = "https://t/api/now/table"
+        # Every row lacks sys_id, so the cursor can never advance, and the page
+        # is exactly dict_page_size so more rows certainly remain.
+        rows = [{"name": "incident", "element": f"f{i}", "internal_type": "string"}
+                for i in range(3)]
+        client.make_request.return_value = {"result": rows}
+
+        fetcher = ServiceNowDictionaryFetcher(client, dict_page_size=3, max_workers=1)
+        with self.assertRaises(ServiceNowIncompleteSyncError) as ctx:
+            fetcher.process_item(["incident"])
+        self.assertIn("incomplete", str(ctx.exception).lower())
+
+    def test_dictionary_short_stalled_page_is_end_of_chunk(self):
+        """A SHORT page with no cursor is the end, not an error."""
+        client = MagicMock()
+        client.base_url = "https://t/api/now/table"
+        rows = [{"name": "incident", "element": "f0", "internal_type": "string"}]
+        client.make_request.return_value = {"result": rows}
+
+        fetcher = ServiceNowDictionaryFetcher(client, dict_page_size=100, max_workers=1)
+        result = fetcher.process_item(["incident"])   # must not raise
+        self.assertIn("incident", result)

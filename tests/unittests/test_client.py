@@ -340,3 +340,26 @@ class TestDatetimeNormalization(unittest.TestCase):
         with patch("tap_servicenow.datetime_utils.LOGGER") as mock_log:
             to_snow_dt("2024-02-01T12:34:56Z")
         mock_log.warning.assert_not_called()
+
+
+class TestSessionAuthBinding(unittest.TestCase):
+    """Auth must be bound to the Session once, not rewritten per request.
+
+    requests.Session is not documented as thread-safe and the discovery pool
+    runs ten threads through it. This fix was silently lost once already - it
+    was described in a commit message but absent from the commit - because no
+    test covered it.
+    """
+
+    def test_auth_is_bound_at_construction(self):
+        client = Client(default_config)
+        self.assertIsInstance(client._session.auth, requests.auth.HTTPBasicAuth)
+        self.assertEqual(client._session.auth.username, default_config["user"])
+
+    def test_authenticate_does_not_rewrite_session_auth(self):
+        client = Client(default_config)
+        sentinel = object()
+        client._session.auth = sentinel
+        client.authenticate({}, {})
+        self.assertIs(client._session.auth, sentinel,
+                      "authenticate() must not touch Session.auth")
