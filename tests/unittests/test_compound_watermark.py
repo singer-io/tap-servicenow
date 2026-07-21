@@ -653,8 +653,50 @@ class TestGetRecordsPermissionErrors(unittest.TestCase):
 
         self.assertIn("Permission error while syncing stream 'base_stream'", str(ctx.exception))
 
-    def test_stalled_cursor_logs_critical(self):
-        pass  # stall detection removed from get_records(); offset pagination has no cursor
+    def test_repeated_page_raises_instead_of_looping_forever(self):
+        """A server that ignores sysparm_offset must not spin the loop forever.
+
+        Without X-Total-Count the only stop condition is an empty page, so a
+        server that keeps returning the same non-empty page never terminates.
+        That is what a query_range ACL denial looks like: HTTP 200 with the
+        pagination clause silently dropped. It has to raise - FullTableStream
+        just drains this generator, so returning normally would report a
+        truncated table as a complete one.
+        """
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        client.get_total_count.return_value = None
+        # Same page forever, regardless of offset.
+        client.make_request.return_value = {
+            "result": [_record("id-1", "2024-01-01T00:00:00Z")]
+        }
+        stream = ConcreteBase(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
+
+        from tap_servicenow.exceptions import ServiceNowIncompleteSyncError
+        with self.assertRaises(ServiceNowIncompleteSyncError) as ctx:
+            list(stream.get_records())
+        self.assertIn("NOT fully replicated", str(ctx.exception))
+
+    def test_repeated_page_is_not_emitted_twice(self):
+        """The duplicate page must be detected before anything is yielded."""
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        client.get_total_count.return_value = None
+        client.make_request.return_value = {
+            "result": [_record("id-1", "2024-01-01T00:00:00Z")]
+        }
+        stream = ConcreteBase(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
+
+        from tap_servicenow.exceptions import ServiceNowIncompleteSyncError
+        emitted = []
+        with self.assertRaises(ServiceNowIncompleteSyncError):
+            for r in stream.get_records():
+                emitted.append(r)
+        self.assertEqual(len(emitted), 1, "the repeated page was emitted twice")
 
     def test_no_stall_warning_on_healthy_pagination(self):
         """Healthy multi-page pagination completes without raising."""

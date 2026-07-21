@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 import json
-from typing import Any, Dict, NoReturn, Tuple, List, Iterator
+from typing import Any, Dict, NoReturn, Optional, Tuple, List, Iterator
 import singer
 from singer import (
     Transformer,
@@ -167,6 +167,15 @@ class BaseStream(ABC):
         # ── Step 2: offset-paginate through the full range ───────────────────
         offset = 0
 
+        # Bound the no-total_count path. Without a count there is no upper limit
+        # on the loop, and its only stop condition is an empty page - so a server
+        # that ignores sysparm_offset and keeps returning the same non-empty page
+        # spins forever. That is what a query_range ACL denial looks like: HTTP
+        # 200 with the pagination clause silently dropped. Track the sys_ids we
+        # have already seen at the page level; a page that adds nothing new means
+        # the cursor is not advancing.
+        seen_page_signature: Optional[frozenset] = None
+
         while True:
             if total_count is not None and offset >= total_count:
                 break
@@ -198,10 +207,25 @@ class BaseStream(ABC):
 
                 raw_records = response.get(self.data_key, [])
 
-                # Buffer the page before emitting any of it. On a stall the same
-                # rows come back a second time, and yielding as we go meant the
-                # duplicate page was already downstream before we detected it.
-                page: List = []
+                # Detect a non-advancing cursor BEFORE emitting, so a repeated
+                # page is never sent downstream twice.
+                signature = frozenset(
+                    r.get("sys_id", "") for r in raw_records if r
+                )
+                if (
+                    total_count is None
+                    and signature
+                    and signature == seen_page_signature
+                ):
+                    raise ServiceNowIncompleteSyncError(
+                        f"Stream '{self.tap_stream_id}' stopped before the end of "
+                        f"its data: the server returned the same page of "
+                        f"{len(raw_records)} row(s) at offset {offset}, so "
+                        f"sysparm_offset is not advancing. The table is NOT "
+                        f"fully replicated."
+                    )
+                seen_page_signature = signature
+
                 for record in raw_records:
                     if record:  # skip empty {} records
                         yield record
