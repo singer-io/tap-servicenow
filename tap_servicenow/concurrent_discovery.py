@@ -538,7 +538,7 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
                 )
                 return None
 
-            # Field-level permission check: test each field individually
+            # Field-level permission check: test fields in batches
             # and remove fields that don't have read permission
             LOGGER.info(
                 "Checking field-level permissions for table '%s' (%d fields)...",
