@@ -189,9 +189,11 @@ class BaseStream(ABC):
                 )
                 raw_records = response.get(self.data_key, [])
                 prev_sys_id = last_sys_id
+                readable_on_page = 0
 
                 for record in raw_records:
                     if record:  # skip empty {} records
+                        readable_on_page += 1
                         last_sys_id = record.get("sys_id", last_sys_id)
                         yield record
 
@@ -201,6 +203,21 @@ class BaseStream(ABC):
                 # page silently truncates the table. The cursor-advance check
                 # guards against an all-empty page looping forever.
                 has_more = bool(raw_records) and last_sys_id != prev_sys_id
+
+                # sys_id is a unique primary key, so a page carrying readable
+                # records must move the cursor. If it did not, ServiceNow served
+                # the same page twice - which is what happens when a query_range
+                # ACL denial strips the `sys_id>` clause and answers HTTP 200.
+                # There is no cursor left to follow, so stopping is right, but
+                # the caller must not read this as a complete table.
+                if not has_more and readable_on_page and last_sys_id == prev_sys_id:
+                    LOGGER.critical(
+                        "Stream '%s': keyset cursor did not advance past sys_id "
+                        "'%s' despite %d readable record(s) on the page. "
+                        "ServiceNow may be dropping the range clause from the "
+                        "query (query_range ACL). This table is INCOMPLETE.",
+                        self.tap_stream_id, last_sys_id, readable_on_page,
+                    )
 
             except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
                 LOGGER.critical(
@@ -338,6 +355,7 @@ class IncrementalStream(BaseStream):
             last_page_dt: str = ""
             last_page_sid: str = ""
             has_more: bool = True
+            cursor_stalled: bool = False
             try:
                 while has_more:
                     if last_page_dt and last_page_sid:
@@ -383,11 +401,13 @@ class IncrementalStream(BaseStream):
 
                     raw_records = response.get(self.data_key, [])
                     prev_page_dt, prev_page_sid = last_page_dt, last_page_sid
+                    readable_on_page = 0
 
                     for record in raw_records:
                         if isinstance(record, dict) and not record:
                             empty_record_count += 1
                             continue
+                        readable_on_page += 1
 
                         record = self.modify_object(record, parent_obj)
 
@@ -423,14 +443,50 @@ class IncrementalStream(BaseStream):
                     # the bookmark then skips over. The cursor-advance check
                     # prevents an infinite loop on a page that yields no
                     # advanceable (sys_updated_on, sys_id).
-                    has_more = bool(raw_records) and (
+                    cursor_advanced = (
                         last_page_dt != prev_page_dt or last_page_sid != prev_page_sid
                     )
+                    has_more = bool(raw_records) and cursor_advanced
 
-                state = write_bookmark(
-                    state, self.tap_stream_id, replication_key, current_max_dt
-                )
-                singer.write_state(state)
+                    # A page carrying readable records must advance the cursor:
+                    # sys_id is a unique primary key, so two consecutive pages
+                    # ending on the same (sys_updated_on, sys_id) means we were
+                    # served the same page twice. That happens when ServiceNow
+                    # drops our range clauses instead of honoring them - a
+                    # query_range ACL denial is answered with HTTP 200 and the
+                    # offending clause silently removed, which strips both the
+                    # bookmark filter and the keyset cursor.
+                    #
+                    # Stopping here is right (there is no cursor left to follow),
+                    # but advancing the bookmark is not: everything past this page
+                    # would be skipped forever on a run that reported success.
+                    # A stall with no readable records is the ordinary
+                    # ACL-hidden-rows case and is reported via empty_record_count.
+                    if not cursor_advanced and readable_on_page:
+                        cursor_stalled = True
+                        LOGGER.critical(
+                            "Stream '%s': keyset cursor did not advance past "
+                            "(%s, %s) despite %d readable record(s) on the page. "
+                            "ServiceNow may be dropping the range clauses from "
+                            "the query (query_range ACL). Stopping and leaving "
+                            "the bookmark unchanged - this sync is incomplete.",
+                            self.tap_stream_id, last_page_dt, last_page_sid,
+                            readable_on_page,
+                        )
+
+                if cursor_stalled:
+                    # Deliberately not writing the bookmark: re-reading this
+                    # range next run is cheap, skipping it is permanent.
+                    LOGGER.warning(
+                        "Stream '%s': bookmark left at '%s' because the sync did "
+                        "not complete.",
+                        self.tap_stream_id, bookmark_dt,
+                    )
+                else:
+                    state = write_bookmark(
+                        state, self.tap_stream_id, replication_key, current_max_dt
+                    )
+                    singer.write_state(state)
 
                 if empty_record_count > 0:
                     LOGGER.warning(
