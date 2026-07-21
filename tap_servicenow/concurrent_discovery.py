@@ -231,9 +231,82 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
                 self._resolve_cache[table_name] = merged
             return merged
 
-    def _check_field_permissions(self, table: str, fields: Dict) -> Tuple[Dict, List[str]]:
-        """Check field-level read permissions by testing each field individually.
+    def _check_field_batch(self, table: str, field_names: List[str]) -> bool:
+        """Check if a batch of fields is accessible by querying them together.
+        
+        Uses a query pattern similar to sync to catch query-dependent field permissions.
+        ServiceNow's field-level ACLs can be query-dependent - a field might be
+        readable with a simple query but not with filter conditions.
+        
+        Returns:
+            bool: True if all fields in batch are accessible, False if any are not
+        """
+        try:
+            # Match sync query pattern: include sys_updated_on filter + ORDER BY
+            # Some ACLs are only triggered when filtering on dates/bookmarks
+            query_params = {
+                "sysparm_fields": ",".join(field_names),
+                "sysparm_limit": 1,
+                "sysparm_no_count": "true",
+                "sysparm_exclude_reference_link": "true",
+            }
+            
+            # If table has sys_updated_on, use the same filter pattern as incremental sync
+            # This catches ACLs that are only enforced when filtering by date
+            if "sys_updated_on" in field_names or any(f.startswith("sys_") for f in field_names):
+                # Use a date filter similar to sync (far past date to match any records)
+                query_params["sysparm_query"] = "sys_updated_on>=1970-01-01 00:00:00^ORDERBYsys_updated_on^ORDERBYsys_id"
+            else:
+                # Fallback to simple ordering
+                query_params["sysparm_query"] = "ORDERBYsys_id"
+            
+            self.client.get(table=table, params=query_params)
+            return True
+        except ServiceNowForbiddenError:
+            return False
 
+    def _find_unauthorized_fields(
+        self, table: str, field_names: List[str]
+    ) -> List[str]:
+        """Use divide-and-conquer to find which fields in a batch are unauthorized.
+        
+        Returns:
+            List[str]: List of unauthorized field names
+        """
+        if not field_names:
+            return []
+        
+        # Base case: single field
+        if len(field_names) == 1:
+            if self._check_field_batch(table, field_names):
+                return []
+            else:
+                return field_names
+        
+        # Divide: split into two halves
+        mid = len(field_names) // 2
+        left_half = field_names[:mid]
+        right_half = field_names[mid:]
+        
+        unauthorized = []
+        
+        # Conquer: recursively check each half
+        if not self._check_field_batch(table, left_half):
+            unauthorized.extend(self._find_unauthorized_fields(table, left_half))
+        
+        if not self._check_field_batch(table, right_half):
+            unauthorized.extend(self._find_unauthorized_fields(table, right_half))
+        
+        return unauthorized
+
+    def _check_field_permissions(self, table: str, fields: Dict) -> Tuple[Dict, List[str]]:
+        """Check field-level read permissions using optimized batch testing.
+        
+        Strategy:
+        1. Test all fields at once (best case: 1 API call)
+        2. If that fails, use divide-and-conquer to find unauthorized fields
+        3. Binary search minimizes API calls: log2(N) instead of N calls
+        
         Returns:
             Tuple[Dict, List[str]]: (authorized_fields, unauthorized_field_names)
         """
@@ -244,45 +317,51 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
         if "sys_id" in fields:
             authorized_fields["sys_id"] = fields["sys_id"]
 
-        # Check each field (except sys_id which we already included)
+        # Get list of fields to check (excluding sys_id)
         fields_to_check = [f for f in fields.keys() if f != "sys_id"]
+        
+        if not fields_to_check:
+            return authorized_fields, unauthorized_fields
 
-        for field_name in fields_to_check:
-            try:
-                # Make a lightweight query requesting only this single field
-                # If the field is unauthorized, ServiceNow will return 403
-                self.client.get(
-                    table=table,
-                    params={
-                        "sysparm_fields": field_name,
-                        "sysparm_limit": 1,
-                        "sysparm_no_count": "true",
-                        "sysparm_exclude_reference_link": "true",
-                    },
-                )
-                # Field is accessible
-                authorized_fields[field_name] = fields[field_name]
-
-            except ServiceNowForbiddenError:
-                # Field is not accessible - exclude from schema
-                unauthorized_fields.append(field_name)
+        try:
+            # OPTIMIZATION: Try all fields at once first (best case: 1 API call)
+            all_accessible = self._check_field_batch(table, fields_to_check)
+            
+            if all_accessible:
+                # All fields are accessible - include them all
+                for field_name in fields_to_check:
+                    authorized_fields[field_name] = fields[field_name]
+            else:
+                # Some fields are unauthorized - use divide-and-conquer to find them
                 LOGGER.debug(
-                    "Field '%s' in table '%s' is not accessible due to "
-                    "insufficient permissions.",
-                    field_name,
-                    table,
+                    "Table '%s': Some fields are unauthorized, narrowing down...",
+                    table
                 )
+                unauthorized_fields = self._find_unauthorized_fields(table, fields_to_check)
+                
+                # Include only authorized fields
+                for field_name in fields_to_check:
+                    if field_name not in unauthorized_fields:
+                        authorized_fields[field_name] = fields[field_name]
+                
+                # Log each unauthorized field at debug level
+                for field_name in unauthorized_fields:
+                    LOGGER.debug(
+                        "Field '%s' in table '%s' is not accessible due to "
+                        "insufficient permissions.",
+                        field_name,
+                        table,
+                    )
 
-            except Exception as exc:
-                # For other exceptions, include the field but log a warning
-                # This prevents transient errors from removing valid fields
-                LOGGER.warning(
-                    "Error checking field '%s' in table '%s': %s. "
-                    "Including field in schema.",
-                    field_name,
-                    table,
-                    exc,
-                )
+        except Exception as exc:
+            # For unexpected exceptions, include all fields but log a warning
+            LOGGER.warning(
+                "Error checking field permissions for table '%s': %s. "
+                "Including all fields in schema.",
+                table,
+                exc,
+            )
+            for field_name in fields_to_check:
                 authorized_fields[field_name] = fields[field_name]
 
         return authorized_fields, unauthorized_fields
