@@ -51,6 +51,15 @@ class MockResponse:
         self.text = text
         self.reason = "error"
 
+    def __bool__(self):
+        """Mirror requests.Response.__bool__, which returns self.ok.
+
+        Without this the double is truthy for 4xx/5xx while the real object is
+        falsy, so a `if response:` guard passes here and fails in production.
+        That is exactly how the Retry-After parsing bug survived a green suite.
+        """
+        return self.status_code < 400
+
     def raise_for_status(self):
         """If an error occur, this method returns a HTTPError object.
 
@@ -187,6 +196,48 @@ class TestRetryWaitSchedule(unittest.TestCase):
             with suppress(Exception):
                 always_fails()
         return slept
+
+    @staticmethod
+    def _real_response(status_code, retry_after=None):
+        """A genuine requests.Response, not a double.
+
+        requests.Response.__bool__ returns self.ok, so every error response is
+        falsy. A `if response:` guard therefore discards the Retry-After header
+        on exactly the 429s and 503s it exists to read. The test doubles in this
+        module are truthy unless they mirror that, so this asserts against the
+        real object.
+        """
+        resp = requests.Response()
+        resp.status_code = status_code
+        if retry_after is not None:
+            resp.headers["Retry-After"] = str(retry_after)
+        return resp
+
+    def test_retry_after_parsed_from_real_falsy_response(self):
+        """The header must survive a response object that is falsy."""
+        resp = self._real_response(429, 60)
+        self.assertFalse(bool(resp))          # documents the trap
+        self.assertEqual(ServiceNowRateLimitError("429", resp).retry_after, 60)
+
+    def test_retry_after_parsed_on_5xx_too(self):
+        """ServiceNow sends Retry-After on 503 during instance maintenance."""
+        resp = self._real_response(503, 120)
+        self.assertEqual(
+            ServiceNowServiceUnavailableError("503", resp).retry_after, 120
+        )
+
+    def test_retry_after_absent_or_unparseable_falls_back(self):
+        """No header, or an HTTP-date we do not parse, must not blow up."""
+        self.assertIsNone(ServiceNowRateLimitError("429", self._real_response(429)).retry_after)
+        bad = self._real_response(429)
+        bad.headers["Retry-After"] = "Wed, 21 Oct 2026 07:28:00 GMT"
+        self.assertIsNone(ServiceNowRateLimitError("429", bad).retry_after)
+        self.assertIsNone(ServiceNowRateLimitError("429", None).retry_after)
+
+    def test_real_429_response_sleeps_exactly_retry_after(self):
+        """End-to-end: a real falsy 429 must drive the wait, not expo."""
+        waits = self._waits(lambda: ServiceNowRateLimitError("429", self._real_response(429, 60)))
+        self.assertEqual(waits, [60.0, 60.0, 60.0, 60.0])
 
     def test_retry_after_is_honored_exactly(self):
         """A Retry-After of 60 must wait 60 - not 62, and not uniform(0, 60)."""

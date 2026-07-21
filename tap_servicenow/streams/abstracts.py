@@ -17,6 +17,7 @@ from tap_servicenow.datetime_utils import to_snow_dt
 from tap_servicenow.exceptions import (
     ServiceNowError,
     ServiceNowForbiddenError,
+    ServiceNowIncompleteSyncError,
     ServiceNowUnauthorizedError,
 )
 
@@ -204,19 +205,26 @@ class BaseStream(ABC):
                 # guards against an all-empty page looping forever.
                 has_more = bool(raw_records) and last_sys_id != prev_sys_id
 
-                # sys_id is a unique primary key, so a page carrying readable
-                # records must move the cursor. If it did not, ServiceNow served
-                # the same page twice - which is what happens when a query_range
-                # ACL denial strips the `sys_id>` clause and answers HTTP 200.
-                # There is no cursor left to follow, so stopping is right, but
-                # the caller must not read this as a complete table.
-                if not has_more and readable_on_page and last_sys_id == prev_sys_id:
-                    LOGGER.critical(
-                        "Stream '%s': keyset cursor did not advance past sys_id "
-                        "'%s' despite %d readable record(s) on the page. "
-                        "ServiceNow may be dropping the range clause from the "
-                        "query (query_range ACL). This table is INCOMPLETE.",
-                        self.tap_stream_id, last_sys_id, readable_on_page,
+                # A non-empty page that does not advance the cursor strands us:
+                # the next request would repeat this one. Only an EMPTY page
+                # means end-of-data. Either every row was masked to {} by
+                # field-level ACLs (no cursor value on the page) or ServiceNow
+                # served the same page twice, which is what a query_range ACL
+                # denial looks like - HTTP 200 with the `sys_id>` clause
+                # silently stripped.
+                #
+                # This must raise rather than log. FullTableStream.sync just
+                # drains the generator, so returning normally reports a
+                # truncated table as a completed one - and for a destination
+                # that truncate-and-replaces, the missing rows get deleted
+                # downstream.
+                if raw_records and last_sys_id == prev_sys_id:
+                    raise ServiceNowIncompleteSyncError(
+                        f"Stream '{self.tap_stream_id}' stopped before the end of "
+                        f"its data: the keyset cursor stalled at sys_id "
+                        f"'{last_sys_id}' on a page of {len(raw_records)} row(s), "
+                        f"{readable_on_page} of them readable. The table is NOT "
+                        f"fully replicated."
                     )
 
             except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
@@ -448,45 +456,36 @@ class IncrementalStream(BaseStream):
                     )
                     has_more = bool(raw_records) and cursor_advanced
 
-                    # A page carrying readable records must advance the cursor:
-                    # sys_id is a unique primary key, so two consecutive pages
-                    # ending on the same (sys_updated_on, sys_id) means we were
-                    # served the same page twice. That happens when ServiceNow
-                    # drops our range clauses instead of honoring them - a
-                    # query_range ACL denial is answered with HTTP 200 and the
-                    # offending clause silently removed, which strips both the
-                    # bookmark filter and the keyset cursor.
+                    # A non-empty page that does not advance the cursor leaves us
+                    # with nowhere to go: the next request would repeat this one.
+                    # Only an EMPTY page means end-of-data (KB0727636) - a page
+                    # with rows on it does not, whatever those rows contain. Two
+                    # ways to get here, both of which strand the sync mid-table:
                     #
-                    # Stopping here is right (there is no cursor left to follow),
-                    # but advancing the bookmark is not: everything past this page
-                    # would be skipped forever on a run that reported success.
-                    # A stall with no readable records is the ordinary
-                    # ACL-hidden-rows case and is reported via empty_record_count.
-                    if not cursor_advanced and readable_on_page:
+                    #  - readable rows that repeat: sys_id is a unique primary
+                    #    key, so the same trailing (sys_updated_on, sys_id) twice
+                    #    means ServiceNow served the same page twice. That is what
+                    #    a query_range ACL denial looks like - HTTP 200 with the
+                    #    range clauses silently stripped from the query.
+                    #  - rows that are all masked to {}: field-level ACLs can
+                    #    leave a row with no readable fields, so the page carries
+                    #    no cursor value even though rows exist and more pages
+                    #    follow.
+                    #
+                    # Either way the bookmark must not move: everything past this
+                    # page would be skipped forever on a run reporting success.
+                    if raw_records and not cursor_advanced:
                         cursor_stalled = True
                         LOGGER.critical(
                             "Stream '%s': keyset cursor did not advance past "
-                            "(%s, %s) despite %d readable record(s) on the page. "
-                            "ServiceNow may be dropping the range clauses from "
-                            "the query (query_range ACL). Stopping and leaving "
-                            "the bookmark unchanged - this sync is incomplete.",
+                            "(%s, %s) on a page of %d row(s), %d of them readable. "
+                            "ServiceNow may be masking every row on the page, or "
+                            "dropping the range clauses from the query "
+                            "(query_range ACL). Stopping - this sync is "
+                            "INCOMPLETE and the bookmark will not be advanced.",
                             self.tap_stream_id, last_page_dt, last_page_sid,
-                            readable_on_page,
+                            len(raw_records), readable_on_page,
                         )
-
-                if cursor_stalled:
-                    # Deliberately not writing the bookmark: re-reading this
-                    # range next run is cheap, skipping it is permanent.
-                    LOGGER.warning(
-                        "Stream '%s': bookmark left at '%s' because the sync did "
-                        "not complete.",
-                        self.tap_stream_id, bookmark_dt,
-                    )
-                else:
-                    state = write_bookmark(
-                        state, self.tap_stream_id, replication_key, current_max_dt
-                    )
-                    singer.write_state(state)
 
                 if empty_record_count > 0:
                     LOGGER.warning(
@@ -494,9 +493,28 @@ class IncrementalStream(BaseStream):
                         "(possibly due to missing data-level permissions).",
                         self.tap_stream_id, empty_record_count
                     )
+
+                if cursor_stalled:
+                    # Deliberately not writing the bookmark: re-reading this
+                    # range next run is cheap, skipping it is permanent. Raising
+                    # rather than returning a count, because a short record set
+                    # is indistinguishable from a completed sync to the caller.
+                    raise ServiceNowIncompleteSyncError(
+                        f"Stream '{self.tap_stream_id}' stopped before the end of "
+                        f"its data: the keyset cursor stalled at "
+                        f"('{last_page_dt}', '{last_page_sid}'). Bookmark left at "
+                        f"'{bookmark_dt}'; {counter.value} record(s) were emitted "
+                        f"but the table is NOT fully replicated."
+                    )
+
+                state = write_bookmark(
+                    state, self.tap_stream_id, replication_key, current_max_dt
+                )
+                singer.write_state(state)
                 return counter.value
 
-            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError):
+            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError,
+                    ServiceNowIncompleteSyncError):
                 raise
 
             except ServiceNowError as e:

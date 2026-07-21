@@ -339,6 +339,7 @@ class TestIncrementalSync(unittest.TestCase):
         stream.url_endpoint = "https://test.service-now.com/api/now/table/test_stream"
 
         written = []
+        self._bookmarks_written = written
         with patch("tap_servicenow.streams.abstracts.get_bookmark", return_value="2024-01-01T00:00:00Z"):
             with patch("tap_servicenow.streams.abstracts.write_bookmark",
                        side_effect=lambda s, st, k, v: written.append(v) or s):
@@ -347,7 +348,7 @@ class TestIncrementalSync(unittest.TestCase):
                         stream.sync(state={}, transformer=t)
         return written
 
-    def test_stalled_cursor_does_not_advance_bookmark(self):
+    def test_stalled_cursor_raises_and_does_not_advance_bookmark(self):
         """A page with readable rows that does not move the cursor is anomalous.
 
         sys_id is a unique primary key, so two consecutive pages ending on the
@@ -356,10 +357,14 @@ class TestIncrementalSync(unittest.TestCase):
         and answering HTTP 200. Stopping is correct, but advancing the bookmark
         would skip every remaining row permanently on a run reporting success.
         """
-        written = self._sync_capturing_bookmarks(
-            {"result": [_record("id-1", "2024-02-01T00:00:00Z")]}   # same page forever
-        )
-        self.assertEqual(written, [], "bookmark must be held back on a stalled cursor")
+        from tap_servicenow.exceptions import ServiceNowIncompleteSyncError
+        with self.assertRaises(ServiceNowIncompleteSyncError) as ctx:
+            self._sync_capturing_bookmarks(
+                {"result": [_record("id-1", "2024-02-01T00:00:00Z")]}  # same page forever
+            )
+        self.assertIn("NOT fully replicated", str(ctx.exception))
+        self.assertEqual(self._bookmarks_written, [],
+                         "bookmark must be held back on a stalled cursor")
 
     def test_healthy_pagination_still_advances_bookmark(self):
         """The stall guard must not fire on a normal multi-page sync."""
@@ -370,17 +375,23 @@ class TestIncrementalSync(unittest.TestCase):
         ])
         self.assertEqual(written, ["2024-02-02 00:00:00"])
 
-    def test_all_empty_page_is_not_treated_as_a_stall(self):
-        """Rows hidden by row-level ACLs come back as {} and carry no cursor.
+    def test_fully_masked_page_is_a_stall_not_end_of_data(self):
+        """A page of all-{} rows carries no cursor, so the sync is stranded.
 
-        That is the ordinary ACL case the guard was built for, already reported
-        via empty_record_count - it must not be escalated to the stall path.
+        Only an EMPTY page means end-of-data. A page with rows on it does not,
+        whatever those rows contain - field-level ACLs can mask every field of
+        every row, and more pages still follow. Treating it as a clean finish
+        advanced the bookmark past rows that were never fetched.
         """
-        written = self._sync_capturing_bookmarks([
-            {"result": [{}, {}]},
-            {"result": []},
-        ])
-        self.assertEqual(written, ["2024-01-01 00:00:00"])
+        from tap_servicenow.exceptions import ServiceNowIncompleteSyncError
+        with self.assertRaises(ServiceNowIncompleteSyncError):
+            self._sync_capturing_bookmarks([
+                {"result": [_record("id-1", "2024-02-01T00:00:00Z")]},
+                {"result": [{}, {}]},                       # every row masked
+                {"result": [_record("id-3", "2024-02-03T00:00:00Z")]},
+                {"result": []},
+            ])
+        self.assertEqual(self._bookmarks_written, [])
 
     def test_returns_zero_on_non_permission_servicenow_error(self):
         """Non-permission ServiceNow errors should still be logged and skipped."""
@@ -600,16 +611,10 @@ class TestGetRecordsPermissionErrors(unittest.TestCase):
         stream = ConcreteBase(client, _make_catalog())
         stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
 
-        with patch("tap_servicenow.streams.abstracts.LOGGER") as mock_log:
-            records = list(stream.get_records())
-
-        # Page 1 legitimately advances the cursor off its empty initial value;
-        # page 2 returns the same row, which is where the stall is detected. Two
-        # records rather than an infinite stream is the point - the duplicate is
-        # harmless because targets upsert on the primary key.
-        self.assertEqual(len(records), 2)
-        mock_log.critical.assert_called_once()
-        self.assertIn("INCOMPLETE", mock_log.critical.call_args[0][0])
+        from tap_servicenow.exceptions import ServiceNowIncompleteSyncError
+        with self.assertRaises(ServiceNowIncompleteSyncError) as ctx:
+            list(stream.get_records())
+        self.assertIn("NOT fully replicated", str(ctx.exception))
 
     def test_no_stall_warning_on_healthy_pagination(self):
         """The guard must stay silent when the cursor advances normally."""
@@ -624,11 +629,8 @@ class TestGetRecordsPermissionErrors(unittest.TestCase):
         stream = ConcreteBase(client, _make_catalog())
         stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
 
-        with patch("tap_servicenow.streams.abstracts.LOGGER") as mock_log:
-            records = list(stream.get_records())
-
-        self.assertEqual(len(records), 2)
-        mock_log.critical.assert_not_called()
+        records = list(stream.get_records())
+        self.assertEqual(len(records), 2)   # completes normally, no raise
 
     def test_error_names_real_endpoint_when_url_endpoint_unset(self):
         """get_records is callable before sync sets url_endpoint.
