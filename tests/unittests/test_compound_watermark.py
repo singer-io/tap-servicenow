@@ -529,6 +529,25 @@ class TestGetRecordsPermissionErrors(unittest.TestCase):
 
         self.assertIn("Permission error while syncing stream 'base_stream'", str(ctx.exception))
 
+    def test_error_names_real_endpoint_when_url_endpoint_unset(self):
+        """get_records is callable before sync sets url_endpoint.
+
+        make_request falls back to base_url/path in that case, so the error must
+        name the URL the request actually went to rather than an empty string.
+        """
+        from tap_servicenow.exceptions import ServiceNowForbiddenError
+        stream = self._stream(ServiceNowForbiddenError("403 Forbidden"))
+        stream.url_endpoint = ""      # not yet set by sync()
+
+        with self.assertRaises(ServiceNowForbiddenError) as ctx:
+            list(stream.get_records())
+
+        self.assertIn(
+            "https://test.service-now.com/api/now/table/base_stream",
+            str(ctx.exception),
+        )
+        self.assertNotIn("endpoint ''", str(ctx.exception))
+
     def test_get_records_does_not_yield_partial_page_on_forbidden(self):
         """A mid-table 403 must not silently return the rows gathered so far.
 

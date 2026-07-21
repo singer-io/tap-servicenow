@@ -142,6 +142,12 @@ class BaseStream(ABC):
         last_sys_id: str = ""
         has_more: bool = True
 
+        # url_endpoint is set by FullTableStream.sync before it iterates, but
+        # get_records is also callable directly. Resolve the same fallback
+        # make_request uses so an error raised from here names the URL the
+        # request actually went to rather than an empty string.
+        endpoint: str = self.url_endpoint or self.get_url_endpoint()
+
         # Build field selection from the schema defined on this stream
         fields: str = self.selected_fields()
 
@@ -175,7 +181,7 @@ class BaseStream(ABC):
 
                 response = self.client.make_request(
                     self.http_method,
-                    self.url_endpoint,
+                    endpoint,
                     paginated_params,
                     self.headers,
                     body=json.dumps(self.data_payload),
@@ -199,10 +205,10 @@ class BaseStream(ABC):
             except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
                 LOGGER.critical(
                     "Permission error on %s: %s. Aborting this stream.",
-                    self.url_endpoint,
+                    endpoint,
                     e,
                 )
-                _raise_permission_error(e, self.tap_stream_id, self.url_endpoint)
+                _raise_permission_error(e, self.tap_stream_id, endpoint)
 
             except Exception as e:
                 LOGGER.error("Unexpected error while fetching records: %s", e)
