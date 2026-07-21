@@ -15,7 +15,11 @@ from singer import (
 
 from datetime import timezone
 import dateutil.parser
-from tap_servicenow.exceptions import ServiceNowError, ServiceNowForbiddenError
+from tap_servicenow.exceptions import (
+    ServiceNowError,
+    ServiceNowForbiddenError,
+    ServiceNowUnauthorizedError,
+)
 
 
 def _to_snow_dt(value: str) -> str:
@@ -35,6 +39,18 @@ def _to_snow_dt(value: str) -> str:
         return value
 
 LOGGER = get_logger()
+
+
+def _raise_permission_error(exc: Exception, stream_name: str, endpoint: str) -> None:
+    """Raise a typed permission error with stream/endpoint context."""
+    message = (
+        f"Permission error while syncing stream '{stream_name}' on "
+        f"endpoint '{endpoint}': {exc}"
+    )
+    response = getattr(exc, "response", None)
+    if isinstance(exc, ServiceNowUnauthorizedError):
+        raise ServiceNowUnauthorizedError(message, response) from exc
+    raise ServiceNowForbiddenError(message, response) from exc
 
 
 class BaseStream(ABC):
@@ -197,9 +213,13 @@ class BaseStream(ABC):
                 # guards against an all-empty page looping forever.
                 has_more = bool(raw_records) and last_sys_id != prev_sys_id
 
-            except ServiceNowForbiddenError as e:
-                LOGGER.critical("403 Forbidden on %s: %s", self.url_endpoint, e)
-                has_more = False
+            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
+                LOGGER.critical(
+                    "Permission error on %s: %s. Aborting sync.",
+                    self.url_endpoint,
+                    e,
+                )
+                _raise_permission_error(e, self.tap_stream_id, self.url_endpoint)
 
             except Exception as e:
                 LOGGER.error("Unexpected error while fetching records: %s", e)
@@ -364,9 +384,13 @@ class IncrementalStream(BaseStream):
                             body=json.dumps(self.data_payload),
                             path=self.path,
                         )
-                    except ServiceNowForbiddenError as e:
-                        LOGGER.critical("403 Forbidden on %s: %s", self.url_endpoint, e)
-                        break
+                    except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
+                        LOGGER.critical(
+                            "Permission error on %s: %s. Aborting sync.",
+                            self.url_endpoint,
+                            e,
+                        )
+                        _raise_permission_error(e, self.tap_stream_id, self.url_endpoint)
 
                     raw_records = response.get(self.data_key, [])
                     prev_page_dt, prev_page_sid = last_page_dt, last_page_sid
@@ -427,9 +451,12 @@ class IncrementalStream(BaseStream):
                     )
                 return counter.value
 
+            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
+                _raise_permission_error(e, self.tap_stream_id, self.url_endpoint)
+
             except ServiceNowError as e:
                 # A ServiceNow API error that exhausted retries or is non-retryable
-                # (e.g. 403 Forbidden). Log and skip this stream gracefully.
+                # (excluding permission failures). Log and skip this stream gracefully.
                 LOGGER.critical("Skipping stream '%s' due to: %s", self.tap_stream_id, e)
                 return 0
 
