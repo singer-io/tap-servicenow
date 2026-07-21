@@ -231,6 +231,62 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
                 self._resolve_cache[table_name] = merged
             return merged
 
+    def _check_field_permissions(self, table: str, fields: Dict) -> Tuple[Dict, List[str]]:
+        """Check field-level read permissions by testing each field individually.
+
+        Returns:
+            Tuple[Dict, List[str]]: (authorized_fields, unauthorized_field_names)
+        """
+        authorized_fields = {}
+        unauthorized_fields = []
+
+        # Always include sys_id as it's required for pagination and primary key
+        if "sys_id" in fields:
+            authorized_fields["sys_id"] = fields["sys_id"]
+
+        # Check each field (except sys_id which we already included)
+        fields_to_check = [f for f in fields.keys() if f != "sys_id"]
+
+        for field_name in fields_to_check:
+            try:
+                # Make a lightweight query requesting only this single field
+                # If the field is unauthorized, ServiceNow will return 403
+                self.client.get(
+                    table=table,
+                    params={
+                        "sysparm_fields": field_name,
+                        "sysparm_limit": 1,
+                        "sysparm_no_count": "true",
+                        "sysparm_exclude_reference_link": "true",
+                    },
+                )
+                # Field is accessible
+                authorized_fields[field_name] = fields[field_name]
+
+            except ServiceNowForbiddenError:
+                # Field is not accessible - exclude from schema
+                unauthorized_fields.append(field_name)
+                LOGGER.debug(
+                    "Field '%s' in table '%s' is not accessible due to "
+                    "insufficient permissions.",
+                    field_name,
+                    table,
+                )
+
+            except Exception as exc:
+                # For other exceptions, include the field but log a warning
+                # This prevents transient errors from removing valid fields
+                LOGGER.warning(
+                    "Error checking field '%s' in table '%s': %s. "
+                    "Including field in schema.",
+                    field_name,
+                    table,
+                    exc,
+                )
+                authorized_fields[field_name] = fields[field_name]
+
+        return authorized_fields, unauthorized_fields
+
     def process_item(self, table: str) -> Optional[Dict]:
         """Build the Singer schema and metadata for one ServiceNow table and verify API access."""
         try:
@@ -256,12 +312,6 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
                     table,
                 )
 
-            schema = {
-                "type": "object",
-                "properties": properties,
-                "additionalProperties": False
-            }
-
             # Per-table read-access probe. ServiceNow lists tables in sys_db_object
             # whose DATA the account cannot read, so unreadable tables are dropped
             # here to keep the QTC selection UI to readable streams. client.get's
@@ -279,6 +329,54 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
             except Exception as exc:
                 LOGGER.warning("Error accessing table '%s': %s", table, exc)
                 return None
+
+            # Field-level permission check: test each field individually
+            # and remove fields that don't have read permission
+            LOGGER.info(
+                "Checking field-level permissions for table '%s' (%d fields)...",
+                table,
+                len(properties),
+            )
+            authorized_properties, unauthorized_field_names = self._check_field_permissions(
+                table, properties
+            )
+
+            if unauthorized_field_names:
+                LOGGER.warning(
+                    "Table '%s': Excluded %d field(s) due to insufficient permissions: %s",
+                    table,
+                    len(unauthorized_field_names),
+                    ", ".join(sorted(unauthorized_field_names)),
+                )
+
+            # Use only authorized fields in the schema
+            properties = authorized_properties
+
+            if not properties:
+                LOGGER.warning(
+                    "Table '%s': No accessible fields after permission check. Skipping table.",
+                    table,
+                )
+                with self._unauth_lock:
+                    self.unauthorized_tables.append(table)
+                return None
+
+            # Re-check replication key after field filtering
+            has_replication_key = "sys_updated_on" in properties
+            if not has_replication_key and replication_method == "INCREMENTAL":
+                LOGGER.warning(
+                    "Table '%s': sys_updated_on field not accessible; "
+                    "switching to FULL_TABLE replication.",
+                    table,
+                )
+                replication_method = "FULL_TABLE"
+                valid_replication_keys = []
+            
+            schema = {
+                "type": "object",
+                "properties": properties,
+                "additionalProperties": False
+            }
 
             mdata = metadata.get_standard_metadata(
                 schema=schema,
