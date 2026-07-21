@@ -108,11 +108,9 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
             except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
                 # The stream raised before writing its bookmark, so nothing was
                 # advanced past rows we never fetched. Record it and move on.
-                LOGGER.critical(
-                    "Permission error syncing stream '%s': %s. "
-                    "Continuing with the remaining streams.",
-                    stream_name, e
-                )
+                # The exception already carries the stream and endpoint, so this
+                # only adds what happens next.
+                LOGGER.critical("%s Continuing with the remaining streams.", e)
                 permission_failures.append(stream_name)
                 update_currently_syncing(state, None)
                 continue

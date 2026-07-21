@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 import json
-from typing import Any, Dict, Tuple, List, Iterator
+from typing import Any, Dict, NoReturn, Tuple, List, Iterator
 import singer
 from singer import (
     Transformer,
@@ -21,16 +21,10 @@ from tap_servicenow.exceptions import (
 )
 
 
-def _to_snow_dt(value: str) -> str:
-    """
-    Normalise any datetime string to ServiceNow's native format
-    """
-    return to_snow_dt(value)
-
 LOGGER = get_logger()
 
 
-def _raise_permission_error(exc: Exception, stream_name: str, endpoint: str) -> None:
+def _raise_permission_error(exc: Exception, stream_name: str, endpoint: str) -> NoReturn:
     """Raise a typed permission error with stream/endpoint context."""
     message = (
         f"Permission error while syncing stream '{stream_name}' on "
@@ -204,7 +198,7 @@ class BaseStream(ABC):
 
             except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
                 LOGGER.critical(
-                    "Permission error on %s: %s. Aborting sync.",
+                    "Permission error on %s: %s. Aborting this stream.",
                     self.url_endpoint,
                     e,
                 )
@@ -320,7 +314,7 @@ class IncrementalStream(BaseStream):
         replication_key = self.replication_keys[0] if self.replication_keys else "sys_updated_on"
 
         # --- Retrieve bookmark --------------------------------------------
-        bookmark_dt: str = _to_snow_dt(self.get_bookmark(state, self.tap_stream_id))
+        bookmark_dt: str = to_snow_dt(self.get_bookmark(state, self.tap_stream_id))
         current_max_dt: str = bookmark_dt
 
         page_size: int = self.page_size or 1000
@@ -375,7 +369,7 @@ class IncrementalStream(BaseStream):
                         )
                     except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
                         LOGGER.critical(
-                            "Permission error on %s: %s. Aborting sync.",
+                            "Permission error on %s: %s. Aborting this stream.",
                             self.url_endpoint,
                             e,
                         )
@@ -391,7 +385,7 @@ class IncrementalStream(BaseStream):
 
                         record = self.modify_object(record, parent_obj)
 
-                        record_dt: str = _to_snow_dt(record.get(replication_key) or bookmark_dt)
+                        record_dt: str = to_snow_dt(record.get(replication_key) or bookmark_dt)
                         record_sid: str = record.get("sys_id", "")
 
                         # Advance the keyset cursor to the last record on this page

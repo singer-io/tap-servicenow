@@ -23,7 +23,19 @@ LOGGER = singer.get_logger()
 
 
 def _build_access_probe_params(has_replication_key: bool, start_date: Optional[str]) -> Dict[str, Any]:
-    """Build a discovery probe that exercises the same incremental query path as sync."""
+    """Build a discovery probe that exercises the same incremental query path as sync.
+
+    Putting sys_updated_on in `sysparm_query` is what makes this probe useful:
+    ServiceNow read-checks fields referenced in a query and returns 403
+    ("Field(s) present in the query do not have permission to be read"), so a
+    table that can be listed but not filtered/ordered by the replication key is
+    rejected here rather than failing mid-sync.
+
+    `sysparm_fields` only trims the probe payload. It does NOT detect a
+    field-level ACL denial: ServiceNow answers those with HTTP 200 and simply
+    omits the field, and with `sysparm_limit=1` an empty result set is
+    indistinguishable from a denied field, so there is no safe body-level check.
+    """
     params: Dict[str, Any] = {
         "sysparm_limit": 1,
         "sysparm_no_count": "true",
@@ -41,8 +53,6 @@ def _build_access_probe_params(has_replication_key: bool, start_date: Optional[s
     else:
         params["sysparm_query"] = "ORDERBYsys_updated_on^ORDERBYsys_id"
 
-    # Probe the replication-key field explicitly so discovery can reject
-    # streams that cannot be queried incrementally before sync starts.
     params["sysparm_fields"] = "sys_id,sys_updated_on"
     return params
 
@@ -314,16 +324,22 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
                 "additionalProperties": False
             }
 
-            # Per-table read-access probe. Incremental streams are probed using
-            # the same replication-key query shape sync uses so tables that can
-            # be listed but cannot be filtered/ordered by sys_updated_on are
-            # rejected at discovery time before sync starts.
+            # Per-table read-access probe. ServiceNow lists tables in
+            # sys_db_object whose DATA the account cannot read, so unreadable
+            # tables are dropped here to keep the QTC selection UI to readable
+            # streams. client.get's shared retry policy means a transient 429
+            # retries rather than wrongly dropping a readable table.
+            #
+            # Incremental streams are probed with the same replication-key query
+            # shape sync uses, so a table that can be listed but not
+            # filtered/ordered by sys_updated_on is rejected here instead of
+            # failing mid-sync.
             try:
                 self.client.get(
                     table=table,
                     params=_build_access_probe_params(
                         has_replication_key,
-                        getattr(self.client, "config", {}).get("start_date"),
+                        self.client.config.get("start_date"),
                     ),
                 )
             except (ServiceNowForbiddenError, ServiceNowUnauthorizedError):
