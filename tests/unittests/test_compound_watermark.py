@@ -4,7 +4,7 @@ Unit tests for:
   - BaseStream.get_records  — keyset pagination (sys_id-based, no sysparm_offset)
 """
 import unittest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import singer
 from tap_servicenow.streams.abstracts import IncrementalStream, BaseStream
@@ -273,16 +273,122 @@ class TestIncrementalSync(unittest.TestCase):
         self.assertEqual(count, 1)  # only 1 non-empty record emitted
         self.assertFalse(any(r == {} for r in written))
 
-    def test_returns_zero_on_exception(self):
-        """sync must catch ServiceNow API errors, log critical, and return 0.
-        Non-ServiceNow errors (programming bugs) must propagate.
-        """
+    def test_raises_on_permission_exception(self):
+        """sync must fail fast on permission errors (401/403)."""
         from tap_servicenow.exceptions import ServiceNowForbiddenError
         client = MagicMock()
         client.base_url = "https://test.service-now.com/api/now/table"
         client.config = {"start_date": "2024-01-01T00:00:00Z"}
-        # Simulate a 403 that exhausted retries — a ServiceNowError subclass
+        # Simulate a 403 permission failure.
         client.make_request.side_effect = ServiceNowForbiddenError("403 Forbidden")
+
+        stream = ConcreteIncremental(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/test_stream"
+
+        with patch("tap_servicenow.streams.abstracts.get_bookmark", return_value="2024-01-01T00:00:00Z"):
+            with patch("tap_servicenow.streams.abstracts.write_bookmark", side_effect=lambda s, st, k, v: s):
+                with patch("tap_servicenow.streams.abstracts.singer.write_state"):
+                    with singer.Transformer() as t:
+                        with self.assertRaises(ServiceNowForbiddenError) as ctx:
+                            stream.sync(state={}, transformer=t)
+
+        self.assertIn("Permission error while syncing stream 'test_stream'", str(ctx.exception))
+
+    def test_permission_error_does_not_advance_bookmark(self):
+        """A permission failure must NOT write a bookmark.
+
+        This is the data-loss case the raise exists to prevent: the previous
+        code broke out of the pagination loop and fell through to
+        write_bookmark, saving a watermark that covered rows the tap never
+        fetched. Those rows are then skipped forever on the next run.
+        """
+        from tap_servicenow.exceptions import ServiceNowForbiddenError
+        client = _make_client([
+            # First page succeeds, so current_max_dt advances in memory...
+            {"result": [_record("id-1", "2024-02-01T00:00:00Z")]},
+        ])
+        # ...then the second page 403s part-way through the table.
+        client.make_request.side_effect = [
+            {"result": [_record("id-1", "2024-02-01T00:00:00Z")]},
+            ServiceNowForbiddenError("403 Forbidden"),
+        ]
+
+        stream = ConcreteIncremental(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/test_stream"
+
+        with patch("tap_servicenow.streams.abstracts.get_bookmark", return_value="2024-01-01T00:00:00Z"):
+            with patch("tap_servicenow.streams.abstracts.write_bookmark") as mock_wb:
+                with patch("tap_servicenow.streams.abstracts.singer.write_state"):
+                    with singer.Transformer() as t:
+                        with self.assertRaises(ServiceNowForbiddenError):
+                            stream.sync(state={}, transformer=t)
+
+        mock_wb.assert_not_called()
+
+    def _sync_capturing_bookmarks(self, pages):
+        """Run sync over `pages` and return the bookmark values written."""
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        if isinstance(pages, list):
+            client.make_request.side_effect = pages
+        else:
+            client.make_request.return_value = pages
+
+        stream = ConcreteIncremental(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/test_stream"
+
+        written = []
+        with patch("tap_servicenow.streams.abstracts.get_bookmark", return_value="2024-01-01T00:00:00Z"):
+            with patch("tap_servicenow.streams.abstracts.write_bookmark",
+                       side_effect=lambda s, st, k, v: written.append(v) or s):
+                with patch("tap_servicenow.streams.abstracts.singer.write_state"):
+                    with singer.Transformer() as t:
+                        stream.sync(state={}, transformer=t)
+        return written
+
+    def test_stalled_cursor_does_not_advance_bookmark(self):
+        """A page with readable rows that does not move the cursor is anomalous.
+
+        sys_id is a unique primary key, so two consecutive pages ending on the
+        same (sys_updated_on, sys_id) means ServiceNow served the same page
+        twice - the signature of a query_range ACL stripping the range clauses
+        and answering HTTP 200. Stopping is correct, but advancing the bookmark
+        would skip every remaining row permanently on a run reporting success.
+        """
+        written = self._sync_capturing_bookmarks(
+            {"result": [_record("id-1", "2024-02-01T00:00:00Z")]}   # same page forever
+        )
+        self.assertEqual(written, [], "bookmark must be held back on a stalled cursor")
+
+    def test_healthy_pagination_still_advances_bookmark(self):
+        """The stall guard must not fire on a normal multi-page sync."""
+        written = self._sync_capturing_bookmarks([
+            {"result": [_record("id-1", "2024-02-01T00:00:00Z")]},
+            {"result": [_record("id-2", "2024-02-02T00:00:00Z")]},
+            {"result": []},                                   # normal end-of-data
+        ])
+        self.assertEqual(written, ["2024-02-02 00:00:00"])
+
+    def test_all_empty_page_is_not_treated_as_a_stall(self):
+        """Rows hidden by row-level ACLs come back as {} and carry no cursor.
+
+        That is the ordinary ACL case the guard was built for, already reported
+        via empty_record_count - it must not be escalated to the stall path.
+        """
+        written = self._sync_capturing_bookmarks([
+            {"result": [{}, {}]},
+            {"result": []},
+        ])
+        self.assertEqual(written, ["2024-01-01 00:00:00"])
+
+    def test_returns_zero_on_non_permission_servicenow_error(self):
+        """Non-permission ServiceNow errors should still be logged and skipped."""
+        from tap_servicenow.exceptions import ServiceNowNotFoundError
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        client.make_request.side_effect = ServiceNowNotFoundError("404 Not Found")
 
         stream = ConcreteIncremental(client, _make_catalog())
         stream.url_endpoint = "https://test.service-now.com/api/now/table/test_stream"
@@ -401,10 +507,6 @@ class TestGetRecordsKeyset(unittest.TestCase):
         self.assertIn("ORDERBYsys_id", params["sysparm_query"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # ---------------------------------------------------------------------------
 # BaseStream.selected_fields — catalog field selection drives sysparm_fields
 # ---------------------------------------------------------------------------
@@ -446,6 +548,127 @@ class TestSelectedFields(unittest.TestCase):
     def test_no_metadata_selects_all(self):
         fields = self._base(["sys_id", "a", "b"], {}).selected_fields().split(",")
         self.assertEqual(set(fields), {"sys_id", "a", "b"})
+
+
+# ---------------------------------------------------------------------------
+# BaseStream.get_records — permission errors (FULL_TABLE path)
+# ---------------------------------------------------------------------------
+
+class TestGetRecordsPermissionErrors(unittest.TestCase):
+    """FullTableStream.sync has no error handling of its own, so get_records
+    is the only place a permission failure can be classified on that path."""
+
+    def _stream(self, side_effect):
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        client.make_request.side_effect = side_effect
+        stream = ConcreteBase(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
+        return stream
+
+    def test_get_records_raises_on_forbidden(self):
+        from tap_servicenow.exceptions import ServiceNowForbiddenError
+        stream = self._stream(ServiceNowForbiddenError("403 Forbidden"))
+
+        with self.assertRaises(ServiceNowForbiddenError) as ctx:
+            list(stream.get_records())
+
+        self.assertIn("Permission error while syncing stream 'base_stream'", str(ctx.exception))
+
+    def test_get_records_raises_on_unauthorized(self):
+        """A 401 must stay a 401, not be reclassified as a 403."""
+        from tap_servicenow.exceptions import ServiceNowUnauthorizedError
+        stream = self._stream(ServiceNowUnauthorizedError("401 Unauthorized"))
+
+        with self.assertRaises(ServiceNowUnauthorizedError) as ctx:
+            list(stream.get_records())
+
+        self.assertIn("Permission error while syncing stream 'base_stream'", str(ctx.exception))
+
+    def test_stalled_cursor_logs_critical(self):
+        """get_records has no bookmark to hold back, so it must at least shout.
+
+        FullTableStream.sync consumes this generator and would otherwise treat a
+        stuck cursor as a completed table.
+        """
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        # Same readable row every page: cursor can never advance.
+        client.make_request.return_value = {"result": [_record("id-1", "2024-01-01T00:00:00Z")]}
+        stream = ConcreteBase(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
+
+        with patch("tap_servicenow.streams.abstracts.LOGGER") as mock_log:
+            records = list(stream.get_records())
+
+        # Page 1 legitimately advances the cursor off its empty initial value;
+        # page 2 returns the same row, which is where the stall is detected. Two
+        # records rather than an infinite stream is the point - the duplicate is
+        # harmless because targets upsert on the primary key.
+        self.assertEqual(len(records), 2)
+        mock_log.critical.assert_called_once()
+        self.assertIn("INCOMPLETE", mock_log.critical.call_args[0][0])
+
+    def test_no_stall_warning_on_healthy_pagination(self):
+        """The guard must stay silent when the cursor advances normally."""
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        client.make_request.side_effect = [
+            {"result": [_record("id-1", "2024-01-01T00:00:00Z")]},
+            {"result": [_record("id-2", "2024-01-02T00:00:00Z")]},
+            {"result": []},
+        ]
+        stream = ConcreteBase(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
+
+        with patch("tap_servicenow.streams.abstracts.LOGGER") as mock_log:
+            records = list(stream.get_records())
+
+        self.assertEqual(len(records), 2)
+        mock_log.critical.assert_not_called()
+
+    def test_error_names_real_endpoint_when_url_endpoint_unset(self):
+        """get_records is callable before sync sets url_endpoint.
+
+        make_request falls back to base_url/path in that case, so the error must
+        name the URL the request actually went to rather than an empty string.
+        """
+        from tap_servicenow.exceptions import ServiceNowForbiddenError
+        stream = self._stream(ServiceNowForbiddenError("403 Forbidden"))
+        stream.url_endpoint = ""      # not yet set by sync()
+
+        with self.assertRaises(ServiceNowForbiddenError) as ctx:
+            list(stream.get_records())
+
+        self.assertIn(
+            "https://test.service-now.com/api/now/table/base_stream",
+            str(ctx.exception),
+        )
+        self.assertNotIn("endpoint ''", str(ctx.exception))
+
+    def test_get_records_does_not_yield_partial_page_on_forbidden(self):
+        """A mid-table 403 must not silently return the rows gathered so far.
+
+        The previous behaviour set has_more = False and returned a truncated
+        record set with no error signal anywhere.
+        """
+        from tap_servicenow.exceptions import ServiceNowForbiddenError
+        stream = self._stream([
+            {"result": [_record("id-1", "2024-01-01T00:00:00Z")]},
+            ServiceNowForbiddenError("403 Forbidden"),
+        ])
+
+        collected = []
+        with self.assertRaises(ServiceNowForbiddenError):
+            for record in stream.get_records():
+                collected.append(record)
+
+        # The first page's row is yielded before the failure, but the consumer
+        # sees the exception rather than a clean end-of-stream.
+        self.assertEqual(len(collected), 1)
 
 
 if __name__ == "__main__":

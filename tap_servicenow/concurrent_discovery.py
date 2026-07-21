@@ -15,14 +15,57 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import singer
 from singer import metadata
 
+from tap_servicenow.datetime_utils import to_snow_dt
 from tap_servicenow.exceptions import ServiceNowForbiddenError, ServiceNowUnauthorizedError
 from tap_servicenow.streams import servicenow_type_to_json_type
 
 LOGGER = singer.get_logger()
 
 
+def _build_access_probe_params(has_replication_key: bool, start_date: Optional[str]) -> Dict[str, Any]:
+    """Build a discovery probe that exercises the same incremental query path as sync.
+
+    Putting sys_updated_on in `sysparm_query` is what makes this probe useful:
+    ServiceNow read-checks fields referenced in a query and returns 403
+    ("Field(s) present in the query do not have permission to be read"), so a
+    table that can be listed but not filtered/ordered by the replication key is
+    rejected here rather than failing mid-sync.
+
+    `sysparm_fields` only trims the probe payload. It does NOT detect a
+    field-level ACL denial: ServiceNow answers those with HTTP 200 and simply
+    omits the field, and with `sysparm_limit=1` an empty result set is
+    indistinguishable from a denied field, so there is no safe body-level check.
+    """
+    params: Dict[str, Any] = {
+        "sysparm_limit": 1,
+        "sysparm_no_count": "true",
+        "sysparm_exclude_reference_link": "true",
+    }
+    if not has_replication_key:
+        return params
+
+    bookmark_dt = to_snow_dt(start_date or "")
+    if bookmark_dt:
+        params["sysparm_query"] = (
+            f"sys_updated_on>={bookmark_dt}"
+            f"^ORDERBYsys_updated_on^ORDERBYsys_id"
+        )
+    else:
+        params["sysparm_query"] = "ORDERBYsys_updated_on^ORDERBYsys_id"
+
+    params["sysparm_fields"] = "sys_id,sys_updated_on"
+    return params
+
+
 class ConcurrentDiscovery(ABC):
     """Drives a ServiceNow discovery phase by executing API calls in parallel threads."""
+
+    #: When True, an exception from process_item aborts the whole phase instead of
+    #: dropping just that item. Set on phases whose failure corrupts the catalog
+    #: for every table (the sys_dictionary fetch); left False where skipping one
+    #: item is the intended behavior (the per-table schema build, which drops
+    #: tables the account cannot read).
+    FAIL_FAST: bool = False
 
     def __init__(self, max_workers: int = 10) -> None:
         self.max_workers = max_workers
@@ -50,6 +93,8 @@ class ConcurrentDiscovery(ABC):
                     LOGGER.error(
                         "ConcurrentDiscovery: error processing item %r: %s", item, exc
                     )
+                    if self.FAIL_FAST:
+                        raise
         return results
 
 
@@ -59,6 +104,10 @@ class ServiceNowDictionaryFetcher(ConcurrentDiscovery):
     Groups tables into chunks and fires each chunk as a parallel API request
     using the nameIN encoded-query operator.
     """
+
+    # A failed chunk would leave up to chunk_size tables in the catalog with
+    # silently missing columns, so abort discovery instead of degrading it.
+    FAIL_FAST = True
 
     def __init__(
         self,
@@ -81,6 +130,7 @@ class ServiceNowDictionaryFetcher(ConcurrentDiscovery):
         base_query = f"nameIN{names_in}"
         partial: Dict[str, Dict] = {}
         last_sys_id = ""
+        pages_fetched = 0
         while True:
             query = (
                 f"{base_query}^sys_id>{last_sys_id}^ORDERBYsys_id"
@@ -100,13 +150,22 @@ class ServiceNowDictionaryFetcher(ConcurrentDiscovery):
                     params=params,
                 )
             except Exception as exc:
-                LOGGER.warning(
-                    "sys_dictionary batch query failed for chunk starting %r: %s",
+                # client.make_request already retries transients (RETRY_ON_TRANSIENT,
+                # max_tries=5, honors Retry-After), so a failure here is persistent.
+                # Returning the rows gathered so far would put these tables in the
+                # catalog with silently missing columns, and those columns would then
+                # be absent from the destination with no error anywhere. A failed
+                # discovery is visible and retryable; a truncated schema is neither.
+                LOGGER.error(
+                    "sys_dictionary batch query failed for chunk starting %r "
+                    "after %d page(s): %s",
                     chunk[:3],
+                    pages_fetched,
                     exc,
                 )
-                return partial or None
+                raise
 
+            pages_fetched += 1
             rows = response.get("result", [])
             prev_sys_id = last_sys_id
             for field in rows:
@@ -122,10 +181,13 @@ class ServiceNowDictionaryFetcher(ConcurrentDiscovery):
                     continue
                 partial.setdefault(tbl, {})[elem] = servicenow_type_to_json_type(stype)
 
-            # Fetch another page only if we filled this one (may be more rows);
-            # a partial page means the chunk is exhausted. The cursor-stall check
-            # prevents an infinite loop if a page carries no advanceable sys_id.
-            if len(rows) < self.dict_page_size or last_sys_id == prev_sys_id:
+            # sys_dictionary is an ordinary ACL-protected table, so ServiceNow
+            # applies row-level ACLs AFTER the query here too: a short page does
+            # NOT mean the chunk is exhausted (KB0727636). Stop only on an empty
+            # page, matching get_all_tables, BaseStream.get_records and
+            # IncrementalStream.sync. The cursor-stall check prevents an infinite
+            # loop if a page carries no advanceable sys_id.
+            if not rows or last_sys_id == prev_sys_id:
                 break
         return partial
 

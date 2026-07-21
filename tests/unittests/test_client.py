@@ -1,10 +1,29 @@
 import unittest
+from contextlib import suppress
+
 import requests
 from unittest.mock import patch
 from parameterized import parameterized
 from requests.exceptions import Timeout, ConnectionError, ChunkedEncodingError
-from tap_servicenow.client import Client
-from tap_servicenow.exceptions import *
+from tap_servicenow.client import (
+    Client,
+    MAX_BACKOFF_SECONDS,
+    RETRY_ON_TRANSIENT,
+    retry_after_or_expo,
+)
+from tap_servicenow.exceptions import (
+    ServiceNowBadGatewayError,
+    ServiceNowBadRequestError,
+    ServiceNowConflictError,
+    ServiceNowForbiddenError,
+    ServiceNowInternalServerError,
+    ServiceNowNotFoundError,
+    ServiceNowNotImplementedError,
+    ServiceNowRateLimitError,
+    ServiceNowServiceUnavailableError,
+    ServiceNowUnauthorizedError,
+    ServiceNowUnprocessableEntityError,
+)
 
 
 default_config = {
@@ -113,9 +132,9 @@ class TestClient(unittest.TestCase):
     ])
     @patch("time.sleep")
     def test_make_request_other_failure_with_retry(self, test_name, error, mock_sleep):
-        
+
         with patch.object(self.client._session, "request", side_effect=error) as mock_request:
-            with self.assertRaises(error) as e:
+            with self.assertRaises(error):
                 self.client._Client__make_request("GET", "https://api.example.com/resource")
 
             self.assertEqual(mock_request.call_count, 5)
@@ -147,3 +166,75 @@ class TestClient(unittest.TestCase):
             with self.assertRaises(ServiceNowForbiddenError):
                 self.client.get("incident")
             self.assertEqual(mock_get.call_count, 1)
+
+
+class TestRetryWaitSchedule(unittest.TestCase):
+    """The wait between retries: Retry-After exactly, expo otherwise.
+
+    Both properties were wrong when the Retry-After wait lived in an
+    on_backoff handler: the handler's sleep did not replace backoff's own, so
+    the two stacked, and backoff's default full_jitter rewrote Retry-After to
+    uniform(0, retry_after), letting the tap retry before the server allowed.
+    """
+
+    @staticmethod
+    def _waits(exc_factory):
+        slept = []
+        with patch("time.sleep", side_effect=lambda s: slept.append(s)):
+            @RETRY_ON_TRANSIENT
+            def always_fails():
+                raise exc_factory()
+            with suppress(Exception):
+                always_fails()
+        return slept
+
+    def test_retry_after_is_honored_exactly(self):
+        """A Retry-After of 60 must wait 60 - not 62, and not uniform(0, 60)."""
+        def rate_limited():
+            exc = ServiceNowRateLimitError("429")
+            exc.retry_after = 60
+            return exc
+
+        self.assertEqual(self._waits(rate_limited), [60.0, 60.0, 60.0, 60.0])
+
+    def test_retry_after_is_capped(self):
+        """A hostile Retry-After cannot park the tap for hours."""
+        def rate_limited():
+            exc = ServiceNowRateLimitError("429")
+            exc.retry_after = 99999
+            return exc
+
+        self.assertEqual(
+            self._waits(rate_limited), [MAX_BACKOFF_SECONDS] * 4
+        )
+
+    def test_expo_fallback_when_no_retry_after(self):
+        """Without a Retry-After header, fall back to jittered 2/4/8/16."""
+        waits = self._waits(lambda: ConnectionResetError("reset"))
+        self.assertEqual(len(waits), 4)
+        for wait, bound in zip(waits, [2, 4, 8, 16]):
+            self.assertGreaterEqual(wait, 0)
+            self.assertLessEqual(wait, bound)
+
+    def test_expo_counter_is_per_generator(self):
+        """Interleaved requests must not share the attempt counter.
+
+        Discovery runs the probe across a ThreadPoolExecutor, so a wait_gen
+        holding module-level state would let one request's attempt number
+        advance another's backoff. backoff builds one generator per decorated
+        call, so driving two directly and interleaving their sends is the
+        deterministic way to assert that isolation.
+        """
+        exc = ConnectionResetError("reset")
+        gen_a, gen_b = retry_after_or_expo(), retry_after_or_expo()
+        next(gen_a)
+        next(gen_b)
+
+        # Advance A three steps; B must still be on its own first step.
+        bounds_a = [gen_a.send(exc) for _ in range(3)]
+        first_b = gen_b.send(exc)
+
+        for wait, bound in zip(bounds_a, [2, 4, 8]):
+            self.assertLessEqual(wait, bound)
+        # B's first wait is bounded by 2, not by A's fourth step (16).
+        self.assertLessEqual(first_b, 2)

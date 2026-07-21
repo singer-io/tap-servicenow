@@ -5,7 +5,7 @@ Unit tests for:
   - tap_servicenow.streams.get_sync_tables (filtering logic)
 """
 import unittest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 
 from tap_servicenow.streams import (
     DEFAULT_EXCLUDED_TABLES,

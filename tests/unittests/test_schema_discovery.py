@@ -8,12 +8,16 @@ Unit tests for:
       - performance params on access-check requests
 """
 import unittest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 from tap_servicenow.schema import get_dynamic_schema
 from tap_servicenow.streams import DEFAULT_EXCLUDED_TABLES
-from tap_servicenow.concurrent_discovery import ServiceNowDictionaryFetcher
-from tap_servicenow.exceptions import ServiceNowForbiddenError, ServiceNowUnauthorizedError
+from tap_servicenow.concurrent_discovery import (
+    ConcurrentDiscovery,
+    ServiceNowDictionaryFetcher,
+    ServiceNowTableSchemaBuilder,
+)
+from tap_servicenow.exceptions import ServiceNowForbiddenError
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +430,43 @@ class TestUnauthorisedTableHandling(unittest.TestCase):
         params = kwargs.get("params", {})
         self.assertEqual(params.get("sysparm_no_count"), "true")
 
+    def test_incremental_access_check_uses_replication_key_probe(self):
+        """Incremental tables must be probed with the same sys_updated_on query shape used by sync."""
+        table_map = {"incident": ""}
+        client = _make_client(config={"start_date": "2026-01-02T03:04:05Z"})
+        client.make_request.return_value = {
+            "result": _dict_fields("incident", "sys_id", "sys_updated_on")
+        }
+
+        p1, p2 = _patch_tables(table_map, sync_list=["incident"])
+        with p1, p2:
+            get_dynamic_schema(client)
+
+        _, kwargs = client.get.call_args
+        params = kwargs.get("params", {})
+        self.assertEqual(
+            params.get("sysparm_query"),
+            "sys_updated_on>=2026-01-02 03:04:05^ORDERBYsys_updated_on^ORDERBYsys_id",
+        )
+        self.assertEqual(params.get("sysparm_fields"), "sys_id,sys_updated_on")
+
+    def test_full_table_access_check_skips_replication_key_probe(self):
+        """FULL_TABLE streams must use the basic table probe and omit sys_updated_on params."""
+        table_map = {"no_dt_table": ""}
+        client = _make_client(config={"start_date": "2026-01-02T03:04:05Z"})
+        client.make_request.return_value = {
+            "result": _dict_fields("no_dt_table", "sys_id", "name")
+        }
+
+        p1, p2 = _patch_tables(table_map, sync_list=["no_dt_table"])
+        with p1, p2:
+            get_dynamic_schema(client)
+
+        _, kwargs = client.get.call_args
+        params = kwargs.get("params", {})
+        self.assertNotIn("sysparm_query", params)
+        self.assertNotIn("sysparm_fields", params)
+
 
 # ---------------------------------------------------------------------------
 # Singer metadata consistency
@@ -462,10 +503,6 @@ class TestMetadataOutput(unittest.TestCase):
         self.assertEqual(key_props, ["sys_id"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # ---------------------------------------------------------------------------
 # sys_dictionary fetch pagination (ServiceNowDictionaryFetcher.process_item)
 # ---------------------------------------------------------------------------
@@ -480,23 +517,75 @@ class TestDictionaryFetcherPagination(unittest.TestCase):
         return c
 
     def test_paginates_past_the_page_limit(self):
-        # dict_page_size=2: page1 is full (==limit) -> keep going; page2 is short -> stop
+        # dict_page_size=2: page1 is full, page2 is short, page3 is empty -> stop
         page1 = [{"name": "t1", "element": "f1", "internal_type": "string", "sys_id": "s1"},
                  {"name": "t1", "element": "f2", "internal_type": "string", "sys_id": "s2"}]
         page2 = [{"name": "t1", "element": "f3", "internal_type": "string", "sys_id": "s3"}]
-        client = self._client([page1, page2])
+        client = self._client([page1, page2, []])
         fetcher = ServiceNowDictionaryFetcher(client, dict_page_size=2)
         result = fetcher.process_item(["t1"])
         self.assertEqual(set(result["t1"].keys()), {"f1", "f2", "f3"})
-        self.assertEqual(client.make_request.call_count, 2)
+        self.assertEqual(client.make_request.call_count, 3)
 
-    def test_single_short_page_stops_immediately(self):
+    def test_short_page_does_not_stop_pagination(self):
+        """Row-level ACLs are applied post-query, so a short page is not the last
+        page (KB0727636). Stopping there silently drops dictionary fields."""
         page1 = [{"name": "t1", "element": "f1", "internal_type": "string", "sys_id": "s1"}]
-        client = self._client([page1])
+        page2 = [{"name": "t1", "element": "f2", "internal_type": "string", "sys_id": "s2"}]
+        client = self._client([page1, page2, []])
         fetcher = ServiceNowDictionaryFetcher(client, dict_page_size=50)
         result = fetcher.process_item(["t1"])
-        self.assertEqual(result, {"t1": {"f1": {"type": ["string", "null"]}}})
+        self.assertEqual(set(result["t1"].keys()), {"f1", "f2"})
+        self.assertEqual(client.make_request.call_count, 3)
+
+    def test_stops_on_empty_page(self):
+        client = self._client([[]])
+        fetcher = ServiceNowDictionaryFetcher(client, dict_page_size=50)
+        self.assertEqual(fetcher.process_item(["t1"]), {})
         self.assertEqual(client.make_request.call_count, 1)
+
+    def test_stall_guard_stops_when_cursor_cannot_advance(self):
+        """A page carrying no advanceable sys_id must not loop forever."""
+        stalled = [{"name": "t1", "element": "f1", "internal_type": "string", "sys_id": ""}]
+        client = self._client([stalled, stalled, stalled])
+        fetcher = ServiceNowDictionaryFetcher(client, dict_page_size=50)
+        result = fetcher.process_item(["t1"])
+        self.assertEqual(set(result["t1"].keys()), {"f1"})
+        self.assertEqual(client.make_request.call_count, 1)
+
+    def test_request_failure_raises_instead_of_returning_partial(self):
+        """make_request already retries transients (RETRY_ON_TRANSIENT), so a failure
+        here is persistent. Emitting the partial page would put a table in the catalog
+        with silently missing columns."""
+        page1 = [{"name": "t1", "element": "f1", "internal_type": "string", "sys_id": "s1"}]
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.make_request.side_effect = [{"result": page1}, RuntimeError("boom")]
+        fetcher = ServiceNowDictionaryFetcher(client, dict_page_size=1)
+        with self.assertRaises(RuntimeError):
+            fetcher.process_item(["t1"])
+
+    def test_fetch_propagates_dictionary_failure(self):
+        """The dictionary fetch is catalog-wide, so a chunk failure must abort
+        discovery rather than be swallowed by the thread pool."""
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.make_request.side_effect = RuntimeError("boom")
+        fetcher = ServiceNowDictionaryFetcher(client, dict_page_size=50, max_workers=1)
+        with self.assertRaises(RuntimeError):
+            fetcher.fetch(["t1"], chunk_size=1)
+
+    def test_fail_fast_is_opt_in_per_phase(self):
+        """Phases that legitimately skip individual items (the per-table schema
+        build drops tables the account cannot read) must keep swallowing."""
+        self.assertTrue(ServiceNowDictionaryFetcher.FAIL_FAST)
+        self.assertFalse(ServiceNowTableSchemaBuilder.FAIL_FAST)
+
+        class _Skipping(ConcurrentDiscovery):
+            def process_item(self, item):
+                raise RuntimeError("boom")
+
+        self.assertEqual(_Skipping(max_workers=1).run(["a", "b"]), [])
 
 
 if __name__ == "__main__":

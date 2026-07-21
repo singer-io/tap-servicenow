@@ -3,6 +3,10 @@ from typing import Dict
 from singer import metadata
 from tap_servicenow.streams import STREAMS, abstracts
 from tap_servicenow.client import Client
+from tap_servicenow.exceptions import (
+    ServiceNowForbiddenError,
+    ServiceNowUnauthorizedError,
+)
 from tap_servicenow.streams.abstracts import IncrementalStream, FullTableStream
 
 
@@ -79,6 +83,14 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
     last_stream = singer.get_currently_syncing(state)
     LOGGER.info("last/currently syncing stream: {}".format(last_stream))
 
+    # Streams whose sync aborted on a permission error. Collected rather than
+    # raised immediately so one unreadable table cannot cost us every stream
+    # after it: ServiceNow evaluates row-level ACLs after the query runs
+    # (KB0727636), so a table can pass the discovery probe and still 403
+    # part-way through a sync. The run still fails at the end (below) so the
+    # job is not reported as successful.
+    permission_failures = []
+
     with singer.Transformer() as transformer:
         for stream_name in streams_to_sync:
             stream = build_dynamic_stream(client, catalog.get_stream(stream_name))
@@ -91,7 +103,17 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
             write_schema(stream, client, streams_to_sync, catalog)
             LOGGER.info("START Syncing: {}".format(stream_name))
             update_currently_syncing(state, stream_name)
-            total_records = stream.sync(state=state, transformer=transformer)
+            try:
+                total_records = stream.sync(state=state, transformer=transformer)
+            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
+                # The stream raised before writing its bookmark, so nothing was
+                # advanced past rows we never fetched. Record it and move on.
+                # The exception already carries the stream and endpoint, so this
+                # only adds what happens next.
+                LOGGER.critical("%s Continuing with the remaining streams.", e)
+                permission_failures.append(stream_name)
+                update_currently_syncing(state, None)
+                continue
 
             update_currently_syncing(state, None)
             LOGGER.info(
@@ -99,3 +121,14 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
                     stream_name, total_records
                 )
             )
+
+    if permission_failures:
+        raise ServiceNowForbiddenError(
+            "The account lacks 'read' access to {} of {} selected stream(s): {}. "
+            "Bookmarks for these streams were left unchanged; all other streams "
+            "synced successfully.".format(
+                len(permission_failures),
+                len(streams_to_sync),
+                ", ".join(permission_failures),
+            )
+        )

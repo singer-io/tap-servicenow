@@ -1,6 +1,8 @@
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-import backoff, time
+import random
+
+import backoff
 import requests
 from requests import session
 from requests.exceptions import Timeout, ConnectionError, ChunkedEncodingError
@@ -36,13 +38,51 @@ def raise_for_error(response: requests.Response) -> None:
         )
         raise exc(message, response) from None
 
-def wait_if_retry_after(details):
-    """Backoff handler that checks for a 'retry_after' attribute in the exception
-    and sleeps for the specified duration to respect API rate limits.
+MAX_BACKOFF_SECONDS = 300
+
+
+def retry_after_or_expo(base: float = 2, factor: float = 2,
+                        max_value: float = MAX_BACKOFF_SECONDS):
+    """wait_gen honoring ServiceNow's Retry-After, falling back to exponential.
+
+    Yields Retry-After unchanged when the response carried one (429s, and 5xx
+    responses that include the header). Otherwise yields the same exponential
+    schedule as before - 2, 4, 8, 16 seconds - with full jitter applied, for
+    connection resets, timeouts, and 5xx without a header.
+
+    Two things this has to get right, both of which the previous
+    on_backoff-based version got wrong:
+
+    1. Sleeping inside on_backoff does not replace backoff's own sleep.
+       `retry_exception` passes the generated wait to the handler by keyword
+       and then sleeps its own local copy, so the two stacked: a 429 with
+       `Retry-After: 60` waited 62, 64, 68, then 76 seconds. Mutating
+       details['wait'] from the handler does not help either, for the same
+       reason - the sleep never reads it back. Yielding the value here makes
+       it the wait, exactly once.
+
+    2. Jitter must not apply to Retry-After. backoff's default `full_jitter`
+       rewrites any wait to uniform(0, wait), which turns a 60-second
+       Retry-After into anything from 0 to 60 and lets the tap retry well
+       before the server said it may. The decorator therefore passes
+       jitter=None, and this generator jitters only the exponential branch,
+       where spreading retries across the discovery thread pool is what we
+       actually want.
+
+    backoff builds a fresh generator per decorated call, so `attempt` is
+    per-request and safe under that thread pool.
     """
-    exc = details['exception']
-    if hasattr(exc, 'retry_after') and exc.retry_after is not None:
-        time.sleep(exc.retry_after)  # Force exact wait
+    exc = yield
+    attempt = 0
+    while True:
+        retry_after = getattr(exc, "retry_after", None)
+        if retry_after is not None:
+            # Honor the server's instruction exactly; no jitter, no expo.
+            wait = min(float(retry_after), max_value)
+        else:
+            wait = random.uniform(0, min(factor * base ** attempt, max_value))
+            attempt += 1
+        exc = yield wait
 
 
 # Shared retry policy for ALL outbound requests. Retries transient failures
@@ -51,10 +91,11 @@ def wait_if_retry_after(details):
 # immediately for the caller to handle. Both make_request() and the get() access
 # probe use this - previously get() had no retry, so a single 429 during
 # discovery silently dropped a table the account could actually read.
+# jitter=None because retry_after_or_expo applies jitter itself, only on the
+# branch where it is appropriate (see its docstring).
 RETRY_ON_TRANSIENT = backoff.on_exception(
-    wait_gen=backoff.expo,
-    factor=2,
-    on_backoff=wait_if_retry_after,
+    wait_gen=retry_after_or_expo,
+    jitter=None,
     exception=(
         ConnectionResetError,
         ConnectionError,

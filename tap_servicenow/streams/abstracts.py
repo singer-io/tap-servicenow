@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 import json
-from typing import Any, Dict, Tuple, List, Iterator
+from typing import Any, Dict, NoReturn, Tuple, List, Iterator
 import singer
 from singer import (
     Transformer,
@@ -13,28 +13,27 @@ from singer import (
     metadata
 )
 
-from datetime import timezone
-import dateutil.parser
-from tap_servicenow.exceptions import ServiceNowError, ServiceNowForbiddenError
+from tap_servicenow.datetime_utils import to_snow_dt
+from tap_servicenow.exceptions import (
+    ServiceNowError,
+    ServiceNowForbiddenError,
+    ServiceNowUnauthorizedError,
+)
 
-
-def _to_snow_dt(value: str) -> str:
-    """
-    Normalise any datetime string to ServiceNow's native format
-    """
-    if not value:
-        return value
-    try:
-        dt = dateutil.parser.parse(value)
-        # Treat naive datetimes as UTC
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(timezone.utc)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return value
 
 LOGGER = get_logger()
+
+
+def _raise_permission_error(exc: Exception, stream_name: str, endpoint: str) -> NoReturn:
+    """Raise a typed permission error with stream/endpoint context."""
+    message = (
+        f"Permission error while syncing stream '{stream_name}' on "
+        f"endpoint '{endpoint}': {exc}"
+    )
+    response = getattr(exc, "response", None)
+    if isinstance(exc, ServiceNowUnauthorizedError):
+        raise ServiceNowUnauthorizedError(message, response) from exc
+    raise ServiceNowForbiddenError(message, response) from exc
 
 
 class BaseStream(ABC):
@@ -143,6 +142,12 @@ class BaseStream(ABC):
         last_sys_id: str = ""
         has_more: bool = True
 
+        # url_endpoint is set by FullTableStream.sync before it iterates, but
+        # get_records is also callable directly. Resolve the same fallback
+        # make_request uses so an error raised from here names the URL the
+        # request actually went to rather than an empty string.
+        endpoint: str = self.url_endpoint or self.get_url_endpoint()
+
         # Build field selection from the schema defined on this stream
         fields: str = self.selected_fields()
 
@@ -176,7 +181,7 @@ class BaseStream(ABC):
 
                 response = self.client.make_request(
                     self.http_method,
-                    self.url_endpoint,
+                    endpoint,
                     paginated_params,
                     self.headers,
                     body=json.dumps(self.data_payload),
@@ -184,9 +189,11 @@ class BaseStream(ABC):
                 )
                 raw_records = response.get(self.data_key, [])
                 prev_sys_id = last_sys_id
+                readable_on_page = 0
 
                 for record in raw_records:
                     if record:  # skip empty {} records
+                        readable_on_page += 1
                         last_sys_id = record.get("sys_id", last_sys_id)
                         yield record
 
@@ -197,9 +204,28 @@ class BaseStream(ABC):
                 # guards against an all-empty page looping forever.
                 has_more = bool(raw_records) and last_sys_id != prev_sys_id
 
-            except ServiceNowForbiddenError as e:
-                LOGGER.critical("403 Forbidden on %s: %s", self.url_endpoint, e)
-                has_more = False
+                # sys_id is a unique primary key, so a page carrying readable
+                # records must move the cursor. If it did not, ServiceNow served
+                # the same page twice - which is what happens when a query_range
+                # ACL denial strips the `sys_id>` clause and answers HTTP 200.
+                # There is no cursor left to follow, so stopping is right, but
+                # the caller must not read this as a complete table.
+                if not has_more and readable_on_page and last_sys_id == prev_sys_id:
+                    LOGGER.critical(
+                        "Stream '%s': keyset cursor did not advance past sys_id "
+                        "'%s' despite %d readable record(s) on the page. "
+                        "ServiceNow may be dropping the range clause from the "
+                        "query (query_range ACL). This table is INCOMPLETE.",
+                        self.tap_stream_id, last_sys_id, readable_on_page,
+                    )
+
+            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
+                LOGGER.critical(
+                    "Permission error on %s: %s. Aborting this stream.",
+                    endpoint,
+                    e,
+                )
+                _raise_permission_error(e, self.tap_stream_id, endpoint)
 
             except Exception as e:
                 LOGGER.error("Unexpected error while fetching records: %s", e)
@@ -311,7 +337,7 @@ class IncrementalStream(BaseStream):
         replication_key = self.replication_keys[0] if self.replication_keys else "sys_updated_on"
 
         # --- Retrieve bookmark --------------------------------------------
-        bookmark_dt: str = _to_snow_dt(self.get_bookmark(state, self.tap_stream_id))
+        bookmark_dt: str = to_snow_dt(self.get_bookmark(state, self.tap_stream_id))
         current_max_dt: str = bookmark_dt
 
         page_size: int = self.page_size or 1000
@@ -329,6 +355,7 @@ class IncrementalStream(BaseStream):
             last_page_dt: str = ""
             last_page_sid: str = ""
             has_more: bool = True
+            cursor_stalled: bool = False
             try:
                 while has_more:
                     if last_page_dt and last_page_sid:
@@ -364,21 +391,27 @@ class IncrementalStream(BaseStream):
                             body=json.dumps(self.data_payload),
                             path=self.path,
                         )
-                    except ServiceNowForbiddenError as e:
-                        LOGGER.critical("403 Forbidden on %s: %s", self.url_endpoint, e)
-                        break
+                    except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
+                        LOGGER.critical(
+                            "Permission error on %s: %s. Aborting this stream.",
+                            self.url_endpoint,
+                            e,
+                        )
+                        _raise_permission_error(e, self.tap_stream_id, self.url_endpoint)
 
                     raw_records = response.get(self.data_key, [])
                     prev_page_dt, prev_page_sid = last_page_dt, last_page_sid
+                    readable_on_page = 0
 
                     for record in raw_records:
                         if isinstance(record, dict) and not record:
                             empty_record_count += 1
                             continue
+                        readable_on_page += 1
 
                         record = self.modify_object(record, parent_obj)
 
-                        record_dt: str = _to_snow_dt(record.get(replication_key) or bookmark_dt)
+                        record_dt: str = to_snow_dt(record.get(replication_key) or bookmark_dt)
                         record_sid: str = record.get("sys_id", "")
 
                         # Advance the keyset cursor to the last record on this page
@@ -410,14 +443,50 @@ class IncrementalStream(BaseStream):
                     # the bookmark then skips over. The cursor-advance check
                     # prevents an infinite loop on a page that yields no
                     # advanceable (sys_updated_on, sys_id).
-                    has_more = bool(raw_records) and (
+                    cursor_advanced = (
                         last_page_dt != prev_page_dt or last_page_sid != prev_page_sid
                     )
+                    has_more = bool(raw_records) and cursor_advanced
 
-                state = write_bookmark(
-                    state, self.tap_stream_id, replication_key, current_max_dt
-                )
-                singer.write_state(state)
+                    # A page carrying readable records must advance the cursor:
+                    # sys_id is a unique primary key, so two consecutive pages
+                    # ending on the same (sys_updated_on, sys_id) means we were
+                    # served the same page twice. That happens when ServiceNow
+                    # drops our range clauses instead of honoring them - a
+                    # query_range ACL denial is answered with HTTP 200 and the
+                    # offending clause silently removed, which strips both the
+                    # bookmark filter and the keyset cursor.
+                    #
+                    # Stopping here is right (there is no cursor left to follow),
+                    # but advancing the bookmark is not: everything past this page
+                    # would be skipped forever on a run that reported success.
+                    # A stall with no readable records is the ordinary
+                    # ACL-hidden-rows case and is reported via empty_record_count.
+                    if not cursor_advanced and readable_on_page:
+                        cursor_stalled = True
+                        LOGGER.critical(
+                            "Stream '%s': keyset cursor did not advance past "
+                            "(%s, %s) despite %d readable record(s) on the page. "
+                            "ServiceNow may be dropping the range clauses from "
+                            "the query (query_range ACL). Stopping and leaving "
+                            "the bookmark unchanged - this sync is incomplete.",
+                            self.tap_stream_id, last_page_dt, last_page_sid,
+                            readable_on_page,
+                        )
+
+                if cursor_stalled:
+                    # Deliberately not writing the bookmark: re-reading this
+                    # range next run is cheap, skipping it is permanent.
+                    LOGGER.warning(
+                        "Stream '%s': bookmark left at '%s' because the sync did "
+                        "not complete.",
+                        self.tap_stream_id, bookmark_dt,
+                    )
+                else:
+                    state = write_bookmark(
+                        state, self.tap_stream_id, replication_key, current_max_dt
+                    )
+                    singer.write_state(state)
 
                 if empty_record_count > 0:
                     LOGGER.warning(
@@ -427,9 +496,12 @@ class IncrementalStream(BaseStream):
                     )
                 return counter.value
 
+            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError):
+                raise
+
             except ServiceNowError as e:
                 # A ServiceNow API error that exhausted retries or is non-retryable
-                # (e.g. 403 Forbidden). Log and skip this stream gracefully.
+                # (excluding permission failures). Log and skip this stream gracefully.
                 LOGGER.critical("Skipping stream '%s' due to: %s", self.tap_stream_id, e)
                 return 0
 
