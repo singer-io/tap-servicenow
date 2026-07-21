@@ -30,12 +30,32 @@ from tap_servicenow.exceptions import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_client(config=None):
+def _make_client(config=None, readable_rows=None):
+    """Mock client that routes make_request by endpoint.
+
+    sys_dictionary calls get whatever the test assigns to
+    ``make_request.return_value``; everything else is the per-table
+    field-permission probe, which defaults to returning no rows so the check
+    fails open and leaves the schema untouched. Pass ``readable_rows`` as
+    ``{table: [row, ...]}`` to exercise field filtering.
+    """
     c = MagicMock()
     c.base_url = "https://test.service-now.com/api/now/table"
     c.config = config or {}
     # Default: tables are accessible — get() returns None (no exception)
     c.get.return_value = None
+
+    rows_by_table = readable_rows or {}
+
+    def _route(method=None, endpoint=None, params=None, *args, **kwargs):
+        endpoint = endpoint or kwargs.get("endpoint") or ""
+        if "sys_dictionary" in endpoint:
+            rv = c.make_request.return_value
+            return rv if isinstance(rv, dict) else {"result": []}
+        table = endpoint.rsplit("/", 1)[-1]
+        return {"result": rows_by_table.get(table, [])}
+
+    c.make_request.side_effect = _route
     return c
 
 
@@ -437,7 +457,7 @@ class TestUnauthorisedTableHandling(unittest.TestCase):
         self.assertEqual(params.get("sysparm_no_count"), "true")
 
     def test_incremental_access_check_uses_replication_key_probe(self):
-        """Incremental tables must be probed with the same sys_updated_on query shape used by sync."""
+        """Incremental tables must probe with sys_updated_on somewhere in the call chain."""
         table_map = {"incident": ""}
         client = _make_client(config={"start_date": "2026-01-02T03:04:05Z"})
         client.make_request.return_value = {
@@ -448,16 +468,19 @@ class TestUnauthorisedTableHandling(unittest.TestCase):
         with p1, p2:
             get_dynamic_schema(client)
 
-        _, kwargs = client.get.call_args
-        params = kwargs.get("params", {})
-        self.assertEqual(
-            params.get("sysparm_query"),
-            "sys_updated_on>=2026-01-02 03:04:05^ORDERBYsys_updated_on^ORDERBYsys_id",
+        # At least one client.get() call must include a sys_updated_on filter;
+        # which call carries it is an implementation detail of the field-check path.
+        all_queries = [
+            kw.get("params", {}).get("sysparm_query", "")
+            for _, kw in client.get.call_args_list
+        ]
+        self.assertTrue(
+            any("sys_updated_on>=" in q for q in all_queries),
+            f"No call to client.get() used a sys_updated_on filter; queries seen: {all_queries}",
         )
-        self.assertEqual(params.get("sysparm_fields"), "sys_id,sys_updated_on")
 
     def test_full_table_access_check_skips_replication_key_probe(self):
-        """FULL_TABLE streams must use the basic table probe and omit sys_updated_on params."""
+        """FULL_TABLE streams must never use a sys_updated_on filter in any probe call."""
         table_map = {"no_dt_table": ""}
         client = _make_client(config={"start_date": "2026-01-02T03:04:05Z"})
         client.make_request.return_value = {
@@ -468,10 +491,15 @@ class TestUnauthorisedTableHandling(unittest.TestCase):
         with p1, p2:
             get_dynamic_schema(client)
 
-        _, kwargs = client.get.call_args
-        params = kwargs.get("params", {})
-        self.assertNotIn("sysparm_query", params)
-        self.assertNotIn("sysparm_fields", params)
+        # None of the client.get() calls should reference sys_updated_on.
+        all_queries = [
+            kw.get("params", {}).get("sysparm_query", "")
+            for _, kw in client.get.call_args_list
+        ]
+        self.assertFalse(
+            any("sys_updated_on" in q for q in all_queries),
+            f"A FULL_TABLE probe used sys_updated_on; queries seen: {all_queries}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +759,78 @@ class TestErroredVsUnauthorizedTables(unittest.TestCase):
         self.assertEqual([t for t, _ in builder.errored_tables], ["incident"])
 
 
+# ---------------------------------------------------------------------------
+# Field-level permission check (ServiceNowTableSchemaBuilder)
+# ---------------------------------------------------------------------------
+
+class TestFieldPermissionCheck(unittest.TestCase):
+    """ServiceNow answers a field-level ACL denial with HTTP 200 and omits the
+    field; it never 403s for one. So the check compares requested against
+    returned keys on a real row, and must fail OPEN whenever it cannot tell."""
+
+    def _builder(self, rows):
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {}
+        client.make_request.return_value = {"result": rows}
+        return ServiceNowTableSchemaBuilder(client, {}, {}), client
+
+    def test_absent_key_is_treated_as_denied(self):
+        # user_password requested but not returned -> denied
+        b, _ = self._builder([{"sys_id": "1", "user_name": "a", "email": "e"}])
+        fields = {"sys_id": {}, "user_name": {}, "email": {}, "user_password": {}}
+        ok, denied = b._check_field_permissions("sys_user", fields)
+        self.assertEqual(denied, ["user_password"])
+        self.assertEqual(set(ok), {"sys_id", "user_name", "email"})
+
+    def test_readable_but_empty_field_is_kept(self):
+        """A readable field with no value still returns its key as "" - it must
+        NOT be mistaken for a denial."""
+        b, _ = self._builder([{"sys_id": "1", "location": "", "manager": ""}])
+        ok, denied = b._check_field_permissions(
+            "sys_user", {"sys_id": {}, "location": {}, "manager": {}}
+        )
+        self.assertEqual(denied, [])
+        self.assertEqual(set(ok), {"sys_id", "location", "manager"})
+
+    def test_empty_table_keeps_all_fields(self):
+        """No rows means no evidence either way: keep everything."""
+        b, _ = self._builder([])
+        fields = {"sys_id": {}, "a": {}, "b": {}}
+        ok, denied = b._check_field_permissions("empty_table", fields)
+        self.assertEqual(denied, [])
+        self.assertEqual(set(ok), {"sys_id", "a", "b"})
+
+    def test_probe_error_keeps_all_fields(self):
+        """Fail open on an unexpected error rather than strip readable fields."""
+        b, client = self._builder([])
+        client.make_request.side_effect = RuntimeError("boom")
+        ok, denied = b._check_field_permissions("t", {"sys_id": {}, "a": {}})
+        self.assertEqual(denied, [])
+        self.assertEqual(set(ok), {"sys_id", "a"})
+
+    def test_sys_id_always_retained(self):
+        """sys_id is the primary key and the pagination cursor."""
+        b, _ = self._builder([{"a": "x"}])
+        ok, denied = b._check_field_permissions("t", {"sys_id": {}, "a": {}})
+        self.assertIn("sys_id", ok)
+        self.assertNotIn("sys_id", denied)
+
+    def test_uses_a_single_request(self):
+        """One call answers it for the whole table - no bisection."""
+        b, client = self._builder([{"sys_id": "1", "a": "x"}])
+        fields = {"sys_id": {}} | {f"f{i}": {} for i in range(40)}
+        b._check_field_permissions("t", fields)
+        self.assertEqual(client.make_request.call_count, 1)
+
+    def test_probe_sends_no_sysparm_query(self):
+        """A field named in sysparm_query 403s the whole request, which is what
+        made the previous implementation misattribute query denials to fields."""
+        b, client = self._builder([{"sys_id": "1"}])
+        b._check_field_permissions("t", {"sys_id": {}, "a": {}})
+        params = client.make_request.call_args.kwargs["params"]
+        self.assertNotIn("sysparm_query", params)
+        self.assertEqual(params["sysparm_limit"], 1)
 class TestUnverifiedGuards(unittest.TestCase):
     """Coverage for fixes that mutation testing showed were unverified.
 

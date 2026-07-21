@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 import json
-from typing import Any, Dict, NoReturn, Tuple, List, Iterator
+from typing import Any, Dict, NoReturn, Optional, Tuple, List, Iterator
 import singer
 from singer import (
     Transformer,
@@ -125,12 +125,21 @@ class BaseStream(ABC):
 
     def get_records(self) -> Iterator:
         """
-        Fetch records using **keyset pagination** (sys_id-based) instead of
-        offset-based pagination.  Offset pagination degrades linearly because
-        the database must re-scan and discard all preceding rows; keyset
-        pagination stays O(1) per page regardless of position.
+        Fetch records using offset-based pagination driven by X-Total-Count.
 
-        Every request includes the three ServiceNow performance params:
+        A lightweight probe request (sysparm_limit=1, no sysparm_no_count) is
+        made first to obtain the X-Total-Count response header, which reflects
+        the full table size BEFORE row-level ACL filtering.  Pagination then
+        continues until ``offset >= total_count`` rather than stopping on the
+        first empty page.  This correctly handles tables where ServiceNow ACLs
+        hide rows mid-table: an empty page in the middle does NOT mean
+        end-of-data (ServiceNow KB0727636), and records at higher offsets may
+        still be accessible.
+
+        When X-Total-Count is unavailable (virtual tables), falls back to
+        stopping on the first completely empty page.
+
+        Every data request includes the three ServiceNow performance params:
         - sysparm_no_count=true    – skips the expensive COUNT query
         - sysparm_exclude_reference_link=true – trims payload size
         - sysparm_fields           – fetches only schema-selected columns
@@ -140,110 +149,95 @@ class BaseStream(ABC):
         pagination into a single cursor.
         """
         page_size = self.page_size or 1000
-        last_sys_id: str = ""
-        has_more: bool = True
 
         # url_endpoint is set by FullTableStream.sync before it iterates, but
-        # get_records is also callable directly. Resolve the same fallback
-        # make_request uses so an error raised from here names the URL the
-        # request actually went to rather than an empty string.
+        # get_records is also callable directly.
         endpoint: str = self.url_endpoint or self.get_url_endpoint()
-
-        # Build field selection from the schema defined on this stream
         fields: str = self.selected_fields()
 
-        while has_more:
+        # ── Step 1: probe for total record count ─────────────────────────────
+        try:
+            total_count = self.client.get_total_count(
+                endpoint, self.params.copy(), self.headers
+            )
+        except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
+            _raise_permission_error(e, self.tap_stream_id, endpoint)
+
+
+        # ── Step 2: offset-paginate through the full range ───────────────────
+        offset = 0
+
+        # Bound the no-total_count path. Without a count there is no upper limit
+        # on the loop, and its only stop condition is an empty page - so a server
+        # that ignores sysparm_offset and keeps returning the same non-empty page
+        # spins forever. That is what a query_range ACL denial looks like: HTTP
+        # 200 with the pagination clause silently dropped. Track the sys_ids we
+        # have already seen at the page level; a page that adds nothing new means
+        # the cursor is not advancing.
+        seen_page_signature: Optional[frozenset] = None
+
+        while True:
+            if total_count is not None and offset >= total_count:
+                break
+
             try:
                 paginated_params = self.params.copy()
-
-                # Keyset clause appended to whatever base query was set externally
-                base_query = paginated_params.get("sysparm_query", "")
-                if last_sys_id:
-                    keyset = f"sys_id>{last_sys_id}"
-                    paginated_params["sysparm_query"] = (
-                        f"{base_query}^{keyset}^ORDERBYsys_id"
-                        if base_query
-                        else f"{keyset}^ORDERBYsys_id"
-                    )
-                else:
-                    paginated_params["sysparm_query"] = (
-                        f"{base_query}^ORDERBYsys_id" if base_query else "ORDERBYsys_id"
-                    )
-
-                # Remove offset key if it was added by legacy code
-                paginated_params.pop("sysparm_offset", None)
-
-                # Performance params
+                paginated_params["sysparm_offset"] = offset
                 paginated_params["sysparm_limit"] = page_size
                 paginated_params["sysparm_no_count"] = "true"
                 paginated_params["sysparm_exclude_reference_link"] = "true"
                 if fields:
                     paginated_params["sysparm_fields"] = fields
 
-                response = self.client.make_request(
-                    self.http_method,
-                    endpoint,
-                    paginated_params,
-                    self.headers,
-                    body=json.dumps(self.data_payload),
-                    path=self.path,
-                )
+                try:
+                    response = self.client.make_request(
+                        self.http_method,
+                        endpoint,
+                        paginated_params,
+                        self.headers,
+                        body=json.dumps(self.data_payload),
+                        path=self.path,
+                    )
+                except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
+                    LOGGER.critical(
+                        "Permission error on %s: %s. Aborting this stream.",
+                        endpoint, e,
+                    )
+                    _raise_permission_error(e, self.tap_stream_id, endpoint)
+
                 raw_records = response.get(self.data_key, [])
-                prev_sys_id = last_sys_id
-                readable_on_page = 0
 
-                # Buffer the page before emitting any of it. On a stall the same
-                # rows come back a second time, and yielding as we go meant the
-                # duplicate page was already downstream before we detected it.
-                page: List = []
-                for record in raw_records:
-                    if record:  # skip empty {} records
-                        readable_on_page += 1
-                        last_sys_id = record.get("sys_id", last_sys_id)
-                        page.append(record)
-
-                stalled = bool(raw_records) and last_sys_id == prev_sys_id
-                if not stalled:
-                    for record in page:
-                        yield record
-
-                # Row-level ACLs are applied after the query, so a short page is
-                # expected and does NOT mean end-of-data (ServiceNow KB0727636).
-                # Stop only on an empty page; without this, any ACL-filtered short
-                # page silently truncates the table. The cursor-advance check
-                # guards against an all-empty page looping forever.
-                has_more = bool(raw_records) and last_sys_id != prev_sys_id
-
-                # A non-empty page that does not advance the cursor strands us:
-                # the next request would repeat this one. Only an EMPTY page
-                # means end-of-data. Either every row was masked to {} by
-                # field-level ACLs (no cursor value on the page) or ServiceNow
-                # served the same page twice, which is what a query_range ACL
-                # denial looks like - HTTP 200 with the `sys_id>` clause
-                # silently stripped.
-                #
-                # This must raise rather than log. FullTableStream.sync just
-                # drains the generator, so returning normally reports a
-                # truncated table as a completed one - and for a destination
-                # that truncate-and-replaces, the missing rows get deleted
-                # downstream.
-                if stalled:
+                # Detect a non-advancing cursor BEFORE emitting, so a repeated
+                # page is never sent downstream twice.
+                signature = frozenset(
+                    r.get("sys_id", "") for r in raw_records if r
+                )
+                if (
+                    total_count is None
+                    and signature
+                    and signature == seen_page_signature
+                ):
                     raise ServiceNowIncompleteSyncError(
                         f"Stream '{self.tap_stream_id}' stopped before the end of "
-                        f"its data: the keyset cursor stalled at sys_id "
-                        f"'{last_sys_id}' on a page of {len(raw_records)} row(s), "
-                        f"{readable_on_page} of them readable. The table is NOT "
+                        f"its data: the server returned the same page of "
+                        f"{len(raw_records)} row(s) at offset {offset}, so "
+                        f"sysparm_offset is not advancing. The table is NOT "
                         f"fully replicated."
                     )
+                seen_page_signature = signature
 
-            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
-                LOGGER.critical(
-                    "Permission error on %s: %s. Aborting this stream.",
-                    endpoint,
-                    e,
-                )
-                _raise_permission_error(e, self.tap_stream_id, endpoint)
+                for record in raw_records:
+                    if record:  # skip empty {} records
+                        yield record
 
+                # Fallback when total_count is unknown: stop on first empty page.
+                if total_count is None and not raw_records:
+                    break
+
+                offset += page_size
+
+            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError):
+                raise
             except Exception as e:
                 LOGGER.error("Unexpected error while fetching records: %s", e)
                 raise

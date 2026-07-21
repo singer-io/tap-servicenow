@@ -143,6 +143,37 @@ class Client:
         return headers, params
 
     @RETRY_ON_TRANSIENT
+    def get_total_count(
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """Return the total record count from the X-Total-Count response header.
+
+        Makes a lightweight probe request (sysparm_limit=1, no sysparm_no_count)
+        so ServiceNow includes X-Total-Count in the response.  This value
+        reflects the table size BEFORE row-level ACL filtering, letting
+        get_records() paginate through ACL-hidden rows instead of stopping on
+        the first empty page.
+
+        Returns None when the header is absent (e.g. on virtual tables).
+        """
+        probe_params = dict(params or {})
+        probe_params.pop("sysparm_no_count", None)  # must be absent for the header
+        probe_params["sysparm_limit"] = 1
+        probe_params["sysparm_offset"] = 0
+        probe_headers = dict(headers or {})
+        probe_headers, probe_params = self.authenticate(probe_headers, probe_params)
+        response = self._session.get(
+            endpoint, headers=probe_headers, params=probe_params,
+            timeout=self.request_timeout,
+        )
+        raise_for_error(response)
+        count_str = (response.headers.get("X-Total-Count") or "").strip()
+        return int(count_str) if count_str.isdigit() else None
+
+    @RETRY_ON_TRANSIENT
     def get(
         self,
         table: str,

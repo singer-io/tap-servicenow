@@ -1,7 +1,7 @@
 """
 Unit tests for:
   - IncrementalStream.sync  — sys_updated_on bookmark with keyset pagination
-  - BaseStream.get_records  — keyset pagination (sys_id-based, no sysparm_offset)
+  - BaseStream.get_records  — offset-based pagination driven by X-Total-Count
 """
 import unittest
 from unittest.mock import MagicMock, patch
@@ -50,11 +50,16 @@ def _make_catalog(props=None):
 
 
 def _make_client(responses):
-    """make_request returns successive dicts in order."""
+    """make_request returns successive dicts in order.
+
+    get_total_count defaults to None so tests exercise the fallback path
+    (stop on first empty page).  Override it per-test for count-driven tests.
+    """
     c = MagicMock()
     c.base_url = "https://test.service-now.com/api/now/table"
     c.config = {"start_date": "2024-01-01T00:00:00Z"}
     c.make_request.side_effect = responses
+    c.get_total_count.return_value = None
     return c
 
 
@@ -418,52 +423,56 @@ class TestIncrementalSync(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# BaseStream.get_records — keyset pagination
+# BaseStream.get_records — offset-based pagination
 # ---------------------------------------------------------------------------
 
-class TestGetRecordsKeyset(unittest.TestCase):
+class TestGetRecordsOffset(unittest.TestCase):
+    """Tests for BaseStream.get_records() — offset-based pagination.
+
+    get_total_count is stubbed to None by _make_client so tests exercise the
+    fallback path (stop on first empty page) unless overridden explicitly.
+    """
 
     def _stream(self, pages):
-        # Trailing empty page: keyset pagination past the end of a table returns
-        # an empty result set, which is the correct stop signal. A short page is
-        # not, because row-level ACLs shrink pages after the query runs.
+        # Append the terminal empty page that signals end-of-data on the
+        # fallback (no total_count) path.
         client = _make_client([{"result": p} for p in pages] + [{"result": []}])
         stream = ConcreteBase(client, _make_catalog())
         stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
         return stream, client
 
-    def test_single_page_no_offset(self):
+    def test_offset_starts_at_zero(self):
+        """First page request must include sysparm_offset=0."""
         rows = [_record("id-1", "2024-01-01T00:00:00Z")]
         stream, client = self._stream([rows])
-        result = list(stream.get_records())
-        self.assertEqual(len(result), 1)
-        # No sysparm_offset in the call
+        list(stream.get_records())
         params = client.make_request.call_args_list[0][0][2]
-        self.assertNotIn("sysparm_offset", params)
+        self.assertEqual(params.get("sysparm_offset"), 0)
 
-    def test_multi_page_advances_sys_id_cursor(self):
+    def test_offset_advances_by_page_size(self):
+        """Second page must use sysparm_offset == page_size."""
         page1 = [_record(f"id-{i}", "2024-01-01T00:00:00Z") for i in range(5)]
         page2 = [_record("id-99", "2024-01-02T00:00:00Z")]
         stream, client = self._stream([page1, page2])
         stream.page_size = 5
         result = list(stream.get_records())
         self.assertEqual(len(result), 6)
-
         second_params = client.make_request.call_args_list[1][0][2]
-        # Last sys_id from page1 is "id-4"
-        self.assertIn("sys_id>id-4", second_params["sysparm_query"])
+        self.assertEqual(second_params.get("sysparm_offset"), 5)
 
-    def test_no_offset_across_all_pages(self):
+    def test_offset_present_on_all_pages(self):
+        """Every data request must carry a sysparm_offset parameter."""
         page1 = [_record(f"id-{i}", "2024-01-01T00:00:00Z") for i in range(3)]
         page2 = [_record("id-end", "2024-01-02T00:00:00Z")]
         stream, client = self._stream([page1, page2])
         stream.page_size = 3
         list(stream.get_records())
-        for c in client.make_request.call_args_list:
-            params = c[0][2]
-            self.assertNotIn("sysparm_offset", params)
+        for call in client.make_request.call_args_list:
+            params = call[0][2] if len(call[0]) > 2 else {}
+            self.assertIn("sysparm_offset", params)
 
     def test_performance_params_always_present(self):
+        """Every request must carry no_count and exclude_reference_link."""
         rows = [_record("id-1", "2024-01-01T00:00:00Z")]
         stream, client = self._stream([rows])
         list(stream.get_records())
@@ -472,6 +481,7 @@ class TestGetRecordsKeyset(unittest.TestCase):
         self.assertEqual(params.get("sysparm_exclude_reference_link"), "true")
 
     def test_sysparm_fields_from_schema(self):
+        """sysparm_fields must include every key from the stream schema."""
         rows = [_record("id-1", "2024-01-01T00:00:00Z")]
         stream, client = self._stream([rows])
         list(stream.get_records())
@@ -481,6 +491,7 @@ class TestGetRecordsKeyset(unittest.TestCase):
         self.assertTrue(sent_fields.issuperset(schema_keys - {""}))
 
     def test_empty_records_skipped_by_get_records(self):
+        """Empty {} dicts in the result array must not be yielded."""
         rows = [_record("id-1", "2024-01-01T00:00:00Z"), {}]
         stream, client = self._stream([rows])
         result = list(stream.get_records())
@@ -489,10 +500,8 @@ class TestGetRecordsKeyset(unittest.TestCase):
 
     def test_short_page_does_not_stop(self):
         """
-        Regression: ServiceNow returns short pages when row-level ACLs filter
-        rows post-query. A short page must NOT end pagination or the table is
-        silently truncated. Both pages here are shorter than page_size, yet all
-        rows must be returned.
+        ServiceNow returns short pages when row-level ACLs filter rows
+        post-query.  A short page (< page_size) must NOT end pagination.
         """
         page1 = [_record(f"id-{i}", "2024-01-01T00:00:00Z") for i in range(3)]  # < page_size
         page2 = [_record("id-end", "2024-01-02T00:00:00Z")]
@@ -501,21 +510,67 @@ class TestGetRecordsKeyset(unittest.TestCase):
         result = list(stream.get_records())
         self.assertEqual(len(result), 4)
 
-    def test_stops_on_empty_page(self):
-        """get_records stops on the first empty page, not on a short one."""
+    def test_stops_on_empty_page_when_no_total_count(self):
+        """Fallback: stop on first empty page when X-Total-Count is unavailable."""
         page1 = [_record(f"id-{i}", "2024-01-01T00:00:00Z") for i in range(5)]
-        stream, client = self._stream([page1])   # _stream appends the empty page
+        stream, client = self._stream([page1])  # _stream appends the terminal empty page
         stream.page_size = 5
         list(stream.get_records())
-        # One data page + the terminal empty page.
+        # One data page + the terminal empty page = 2 requests.
         self.assertEqual(client.make_request.call_count, 2)
 
-    def test_orderby_sys_id_in_query(self):
+    def test_stops_at_total_count(self):
+        """When get_total_count returns N, pagination stops once offset >= N."""
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        # Table has 3 records; page_size=2 → 2 data pages, no empty-page probe.
+        client.get_total_count.return_value = 3
+        client.make_request.side_effect = [
+            {"result": [_record("id-1", "2024-01-01T00:00:00Z"),
+                        _record("id-2", "2024-01-02T00:00:00Z")]},
+            {"result": [_record("id-3", "2024-01-03T00:00:00Z")]},
+        ]
+        stream = ConcreteBase(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
+        stream.page_size = 2
+
+        result = list(stream.get_records())
+        self.assertEqual(len(result), 3)
+        # offset=0, offset=2 → exactly 2 data requests; no extra empty-page probe.
+        self.assertEqual(client.make_request.call_count, 2)
+
+    def test_continues_through_empty_page_when_total_count_known(self):
+        """
+        When X-Total-Count is available, an empty mid-table page caused by
+        ACL-hidden rows must NOT stop pagination.  Records at higher offsets
+        must still be retrieved.
+        """
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        # Table has 300 rows; only rows at offset 0 and 200 are accessible.
+        client.get_total_count.return_value = 300
+        client.make_request.side_effect = [
+            {"result": [_record("id-1", "2024-01-01T00:00:00Z")]},  # offset=0
+            {"result": []},                                           # offset=100 (ACL hidden)
+            {"result": [_record("id-2", "2024-01-02T00:00:00Z")]},  # offset=200
+        ]
+        stream = ConcreteBase(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
+        stream.page_size = 100
+
+        result = list(stream.get_records())
+        # All 3 pages are visited; both accessible records are returned.
+        self.assertEqual(len(result), 2)
+        self.assertEqual(client.make_request.call_count, 3)
+
+    def test_total_count_probe_called_once(self):
+        """get_total_count must be called exactly once per get_records() call."""
         rows = [_record("id-1", "2024-01-01T00:00:00Z")]
         stream, client = self._stream([rows])
         list(stream.get_records())
-        params = client.make_request.call_args_list[0][0][2]
-        self.assertIn("ORDERBYsys_id", params["sysparm_query"])
+        client.get_total_count.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +629,7 @@ class TestGetRecordsPermissionErrors(unittest.TestCase):
         client.base_url = "https://test.service-now.com/api/now/table"
         client.config = {"start_date": "2024-01-01T00:00:00Z"}
         client.make_request.side_effect = side_effect
+        client.get_total_count.return_value = None  # fallback: stop on empty page
         stream = ConcreteBase(client, _make_catalog())
         stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
         return stream
@@ -597,17 +653,24 @@ class TestGetRecordsPermissionErrors(unittest.TestCase):
 
         self.assertIn("Permission error while syncing stream 'base_stream'", str(ctx.exception))
 
-    def test_stalled_cursor_logs_critical(self):
-        """get_records has no bookmark to hold back, so it must at least shout.
+    def test_repeated_page_raises_instead_of_looping_forever(self):
+        """A server that ignores sysparm_offset must not spin the loop forever.
 
-        FullTableStream.sync consumes this generator and would otherwise treat a
-        stuck cursor as a completed table.
+        Without X-Total-Count the only stop condition is an empty page, so a
+        server that keeps returning the same non-empty page never terminates.
+        That is what a query_range ACL denial looks like: HTTP 200 with the
+        pagination clause silently dropped. It has to raise - FullTableStream
+        just drains this generator, so returning normally would report a
+        truncated table as a complete one.
         """
         client = MagicMock()
         client.base_url = "https://test.service-now.com/api/now/table"
         client.config = {"start_date": "2024-01-01T00:00:00Z"}
-        # Same readable row every page: cursor can never advance.
-        client.make_request.return_value = {"result": [_record("id-1", "2024-01-01T00:00:00Z")]}
+        client.get_total_count.return_value = None
+        # Same page forever, regardless of offset.
+        client.make_request.return_value = {
+            "result": [_record("id-1", "2024-01-01T00:00:00Z")]
+        }
         stream = ConcreteBase(client, _make_catalog())
         stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
 
@@ -616,11 +679,31 @@ class TestGetRecordsPermissionErrors(unittest.TestCase):
             list(stream.get_records())
         self.assertIn("NOT fully replicated", str(ctx.exception))
 
-    def test_no_stall_warning_on_healthy_pagination(self):
-        """The guard must stay silent when the cursor advances normally."""
+    def test_repeated_page_is_not_emitted_twice(self):
+        """The duplicate page must be detected before anything is yielded."""
         client = MagicMock()
         client.base_url = "https://test.service-now.com/api/now/table"
         client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        client.get_total_count.return_value = None
+        client.make_request.return_value = {
+            "result": [_record("id-1", "2024-01-01T00:00:00Z")]
+        }
+        stream = ConcreteBase(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
+
+        from tap_servicenow.exceptions import ServiceNowIncompleteSyncError
+        emitted = []
+        with self.assertRaises(ServiceNowIncompleteSyncError):
+            for r in stream.get_records():
+                emitted.append(r)
+        self.assertEqual(len(emitted), 1, "the repeated page was emitted twice")
+
+    def test_no_stall_warning_on_healthy_pagination(self):
+        """Healthy multi-page pagination completes without raising."""
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        client.get_total_count.return_value = None  # fallback: stop on empty page
         client.make_request.side_effect = [
             {"result": [_record("id-1", "2024-01-01T00:00:00Z")]},
             {"result": [_record("id-2", "2024-01-02T00:00:00Z")]},
@@ -739,10 +822,12 @@ class TestUncursorableRecords(unittest.TestCase):
 
 
 class TestStalledPageNotReEmitted(unittest.TestCase):
-    """get_records must buffer a page until the cursor is known to advance.
+    """get_records must check a page for repetition before emitting it.
 
     On a stall the same rows arrive twice. Yielding as they were read put the
-    duplicate page downstream before the stall was detected.
+    duplicate page downstream before the stall was detected. The stall now
+    comes from a server that ignores sysparm_offset rather than from a keyset
+    cursor, but the requirement is unchanged.
     """
 
     def test_stalled_page_is_not_emitted(self):
@@ -750,8 +835,10 @@ class TestStalledPageNotReEmitted(unittest.TestCase):
         client = MagicMock()
         client.base_url = "https://test.service-now.com/api/now/table"
         client.config = {"start_date": "2024-01-01T00:00:00Z"}
-        # Same single row forever: page 1 advances the cursor off "", page 2
-        # repeats it and must be suppressed.
+        # No X-Total-Count, so the loop's only stop signal is an empty page.
+        client.get_total_count.return_value = None
+        # Same single row forever: page 1 is emitted, page 2 repeats it and
+        # must be suppressed.
         client.make_request.return_value = {
             "result": [_record("id-1", "2024-01-01T00:00:00Z")]
         }

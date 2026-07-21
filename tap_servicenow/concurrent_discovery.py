@@ -10,7 +10,7 @@ from __future__ import annotations
 import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import singer
 from singer import metadata
@@ -346,6 +346,74 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
             self._resolve_cache.setdefault(table_name, merged)
             return self._resolve_cache[table_name]
 
+    def _readable_fields(self, table: str, field_names: List[str]) -> Optional[Set[str]]:
+        """Return the subset of `field_names` ServiceNow actually returns, or None.
+
+        ServiceNow answers a field-level ACL denial with HTTP 200 and simply
+        OMITS the field from the record - it never returns 403 for one. (A 403
+        only happens when a denied field is named in `sysparm_query`.) So the
+        only reliable signal is which keys come back on a real row: ask for
+        every field at once and compare requested against returned.
+
+        A readable-but-empty field still comes back as a key with "", so an
+        absent key means denied rather than merely blank.
+
+        Returns None when the table has no rows, because an empty result set
+        carries no information about field permissions - callers must treat
+        that as "unknown" and keep every field rather than strip them.
+        """
+        response = self.client.make_request(
+            method="GET",
+            endpoint=f"{self.client.base_url}/{table}",
+            params={
+                "sysparm_fields": ",".join(field_names),
+                "sysparm_limit": 1,
+                "sysparm_no_count": "true",
+                "sysparm_exclude_reference_link": "true",
+            },
+        )
+        rows = [r for r in response.get("result", []) if r]
+        if not rows:
+            return None
+        return set(rows[0].keys())
+
+    def _check_field_permissions(
+        self, table: str, fields: Dict
+    ) -> Tuple[Dict, List[str]]:
+        """Drop fields the account cannot read. One request, no bisection.
+
+        The response names every readable field, so there is nothing to search
+        for - a single call answers it for the whole table. `sys_id` is always
+        retained: it is the primary key and the pagination cursor.
+
+        Fails OPEN. If the table is empty or the probe errors, every field is
+        kept. Keeping a field we cannot verify costs a null column; dropping a
+        readable one silently removes data from the destination.
+        """
+        field_names = [f for f in fields if f != "sys_id"]
+        if not field_names:
+            return dict(fields), []
+
+        try:
+            readable = self._readable_fields(table, ["sys_id"] + field_names)
+        except Exception as exc:
+            LOGGER.warning(
+                "Table '%s': field-permission probe failed (%s). Keeping all fields.",
+                table, exc,
+            )
+            return dict(fields), []
+
+        if readable is None:
+            LOGGER.debug(
+                "Table '%s' has no rows; cannot determine field permissions. "
+                "Keeping all fields.", table,
+            )
+            return dict(fields), []
+
+        unauthorized = [f for f in field_names if f not in readable]
+        authorized = {k: v for k, v in fields.items() if k not in unauthorized}
+        return authorized, unauthorized
+
     def process_item(self, table: str) -> Optional[Dict]:
         """Build the Singer schema and metadata for one ServiceNow table and verify API access."""
         try:
@@ -371,22 +439,18 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
                     table,
                 )
 
-            schema = {
-                "type": "object",
-                "properties": properties,
-                "additionalProperties": False
-            }
-
-            # Per-table read-access probe. ServiceNow lists tables in
-            # sys_db_object whose DATA the account cannot read, so unreadable
-            # tables are dropped here to keep the QTC selection UI to readable
-            # streams. client.get's shared retry policy means a transient 429
-            # retries rather than wrongly dropping a readable table.
+            # Per-table read-access probe. ServiceNow lists tables in sys_db_object
+            # whose DATA the account cannot read, so unreadable tables are dropped
+            # here to keep the QTC selection UI to readable streams. client.get's
+            # shared retry policy means a transient 429 retries rather than
+            # wrongly dropping a readable table.
             #
             # Incremental streams are probed with the same replication-key query
-            # shape sync uses, so a table that can be listed but not
-            # filtered/ordered by sys_updated_on is rejected here instead of
-            # failing mid-sync.
+            # shape sync uses, because ServiceNow read-checks fields named in
+            # sysparm_query and 403s there. That 403 says the table cannot be
+            # FILTERED by sys_updated_on - it does NOT say the table is
+            # unreadable, so fall back to the plain probe before giving up and
+            # replicate as FULL_TABLE if the plain read works.
             try:
                 self.client.get(
                     table=table,
@@ -396,11 +460,30 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
                     ),
                 )
             except (ServiceNowForbiddenError, ServiceNowUnauthorizedError):
-                # A real permission answer: this table is deliberately excluded
-                # from the catalog, and schema.py reports the whole set.
-                with self._unauth_lock:
-                    self.unauthorized_tables.append(table)
-                return None
+                if not has_replication_key:
+                    # No query clause was involved, so this is a plain read
+                    # denial: the table is deliberately excluded, and schema.py
+                    # reports the whole set.
+                    with self._unauth_lock:
+                        self.unauthorized_tables.append(table)
+                    return None
+                try:
+                    self.client.get(
+                        table=table,
+                        params={"sysparm_limit": 1, "sysparm_no_count": "true"},
+                    )
+                except (ServiceNowForbiddenError, ServiceNowUnauthorizedError):
+                    with self._unauth_lock:
+                        self.unauthorized_tables.append(table)
+                    return None
+                LOGGER.info(
+                    "Table '%s' is readable but cannot be filtered by "
+                    "sys_updated_on; replicating it as FULL_TABLE.",
+                    table,
+                )
+                has_replication_key = False
+                replication_method = "FULL_TABLE"
+                valid_replication_keys = []
             except Exception as exc:
                 # NOT a permission answer - a 5xx that exhausted its retries, a
                 # timeout, a malformed response. Dropping the table here made a
@@ -416,6 +499,56 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
                     "Excluding it from this catalog.", table, exc
                 )
                 return None
+
+            # Field-level permission check: drop fields the account cannot read
+            # so the catalog does not advertise columns that will always be
+            # absent from the records.
+            LOGGER.debug(
+                "Checking field-level permissions for table '%s' (%d fields)...",
+                table,
+                len(properties),
+            )
+            authorized_properties, unauthorized_field_names = self._check_field_permissions(
+                table, properties
+            )
+
+            if unauthorized_field_names:
+                LOGGER.warning(
+                    "Table '%s': Excluded %d field(s) due to insufficient permissions: %s",
+                    table,
+                    len(unauthorized_field_names),
+                    ", ".join(sorted(unauthorized_field_names)),
+                )
+
+            # Use only authorized fields in the schema
+            properties = authorized_properties
+
+            if not properties:
+                LOGGER.warning(
+                    "Table '%s': No accessible fields after permission check. Skipping table.",
+                    table,
+                )
+                with self._unauth_lock:
+                    self.unauthorized_tables.append(table)
+                return None
+
+            # Re-check the replication key: if sys_updated_on itself came back
+            # unreadable, an incremental sync cannot bookmark on it.
+            if replication_method == "INCREMENTAL" and "sys_updated_on" not in properties:
+                LOGGER.warning(
+                    "Table '%s': sys_updated_on is not readable; "
+                    "switching to FULL_TABLE replication.",
+                    table,
+                )
+                has_replication_key = False
+                replication_method = "FULL_TABLE"
+                valid_replication_keys = []
+
+            schema = {
+                "type": "object",
+                "properties": properties,
+                "additionalProperties": False
+            }
 
             mdata = metadata.get_standard_metadata(
                 schema=schema,
