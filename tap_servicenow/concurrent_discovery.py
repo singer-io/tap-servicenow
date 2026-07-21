@@ -10,36 +10,21 @@ from __future__ import annotations
 import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import dateutil.parser
 import singer
 from singer import metadata
 
 from tap_servicenow.exceptions import ServiceNowForbiddenError, ServiceNowUnauthorizedError
+from tap_servicenow.streams.abstracts import _to_snow_dt
 from tap_servicenow.streams import servicenow_type_to_json_type
 
 LOGGER = singer.get_logger()
 
 
-def _to_snow_dt(value: str) -> str:
-    """Normalise a datetime string to ServiceNow's native format."""
-    if not value:
-        return value
-    try:
-        dt = dateutil.parser.parse(value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(timezone.utc)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return value
-
-
-def _build_access_probe_params(has_replication_key: bool, start_date: Optional[str]) -> Dict[str, str]:
+def _build_access_probe_params(has_replication_key: bool, start_date: Optional[str]) -> Dict[str, Any]:
     """Build a discovery probe that exercises the same incremental query path as sync."""
-    params: Dict[str, str] = {
+    params: Dict[str, Any] = {
         "sysparm_limit": 1,
         "sysparm_no_count": "true",
         "sysparm_exclude_reference_link": "true",
@@ -306,6 +291,7 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
             # Per-table read-access probe. Incremental streams are probed using
             # the same replication-key query shape sync uses so tables that can
             # be listed but cannot be filtered/ordered by sys_updated_on are
+            # rejected at discovery time before sync starts.
             try:
                 self.client.get(
                     table=table,
