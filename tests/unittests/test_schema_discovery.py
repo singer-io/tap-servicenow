@@ -430,6 +430,43 @@ class TestUnauthorisedTableHandling(unittest.TestCase):
         params = kwargs.get("params", {})
         self.assertEqual(params.get("sysparm_no_count"), "true")
 
+    def test_incremental_access_check_uses_replication_key_probe(self):
+        """Incremental tables must be probed with the same sys_updated_on query shape used by sync."""
+        table_map = {"incident": ""}
+        client = _make_client(config={"start_date": "2026-01-02T03:04:05Z"})
+        client.make_request.return_value = {
+            "result": _dict_fields("incident", "sys_id", "sys_updated_on")
+        }
+
+        p1, p2 = _patch_tables(table_map, sync_list=["incident"])
+        with p1, p2:
+            get_dynamic_schema(client)
+
+        _, kwargs = client.get.call_args
+        params = kwargs.get("params", {})
+        self.assertEqual(
+            params.get("sysparm_query"),
+            "sys_updated_on>=2026-01-02 03:04:05^ORDERBYsys_updated_on^ORDERBYsys_id",
+        )
+        self.assertEqual(params.get("sysparm_fields"), "sys_id,sys_updated_on")
+
+    def test_full_table_access_check_skips_replication_key_probe(self):
+        """FULL_TABLE streams must use the basic table probe and omit sys_updated_on params."""
+        table_map = {"no_dt_table": ""}
+        client = _make_client(config={"start_date": "2026-01-02T03:04:05Z"})
+        client.make_request.return_value = {
+            "result": _dict_fields("no_dt_table", "sys_id", "name")
+        }
+
+        p1, p2 = _patch_tables(table_map, sync_list=["no_dt_table"])
+        with p1, p2:
+            get_dynamic_schema(client)
+
+        _, kwargs = client.get.call_args
+        params = kwargs.get("params", {})
+        self.assertNotIn("sysparm_query", params)
+        self.assertNotIn("sysparm_fields", params)
+
 
 # ---------------------------------------------------------------------------
 # Singer metadata consistency

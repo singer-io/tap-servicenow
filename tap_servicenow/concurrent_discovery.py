@@ -15,10 +15,36 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import singer
 from singer import metadata
 
+from tap_servicenow.datetime_utils import to_snow_dt
 from tap_servicenow.exceptions import ServiceNowForbiddenError, ServiceNowUnauthorizedError
 from tap_servicenow.streams import servicenow_type_to_json_type
 
 LOGGER = singer.get_logger()
+
+
+def _build_access_probe_params(has_replication_key: bool, start_date: Optional[str]) -> Dict[str, Any]:
+    """Build a discovery probe that exercises the same incremental query path as sync."""
+    params: Dict[str, Any] = {
+        "sysparm_limit": 1,
+        "sysparm_no_count": "true",
+        "sysparm_exclude_reference_link": "true",
+    }
+    if not has_replication_key:
+        return params
+
+    bookmark_dt = to_snow_dt(start_date or "")
+    if bookmark_dt:
+        params["sysparm_query"] = (
+            f"sys_updated_on>={bookmark_dt}"
+            f"^ORDERBYsys_updated_on^ORDERBYsys_id"
+        )
+    else:
+        params["sysparm_query"] = "ORDERBYsys_updated_on^ORDERBYsys_id"
+
+    # Probe the replication-key field explicitly so discovery can reject
+    # streams that cannot be queried incrementally before sync starts.
+    params["sysparm_fields"] = "sys_id,sys_updated_on"
+    return params
 
 
 class ConcurrentDiscovery(ABC):
@@ -288,15 +314,17 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
                 "additionalProperties": False
             }
 
-            # Per-table read-access probe. ServiceNow lists tables in sys_db_object
-            # whose DATA the account cannot read, so unreadable tables are dropped
-            # here to keep the QTC selection UI to readable streams. client.get's
-            # shared retry policy means a transient 429 retries rather than
-            # wrongly dropping a readable table.
+            # Per-table read-access probe. Incremental streams are probed using
+            # the same replication-key query shape sync uses so tables that can
+            # be listed but cannot be filtered/ordered by sys_updated_on are
+            # rejected at discovery time before sync starts.
             try:
                 self.client.get(
                     table=table,
-                    params={"sysparm_limit": 1, "sysparm_no_count": "true"},
+                    params=_build_access_probe_params(
+                        has_replication_key,
+                        getattr(self.client, "config", {}).get("start_date"),
+                    ),
                 )
             except (ServiceNowForbiddenError, ServiceNowUnauthorizedError):
                 with self._unauth_lock:
