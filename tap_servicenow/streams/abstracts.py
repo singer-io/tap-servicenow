@@ -167,13 +167,28 @@ class BaseStream(ABC):
         # ── Step 2: offset-paginate through the full range ───────────────────
         offset = 0
 
-        # Bound the no-total_count path. Without a count there is no upper limit
-        # on the loop, and its only stop condition is an empty page - so a server
-        # that ignores sysparm_offset and keeps returning the same non-empty page
-        # spins forever. That is what a query_range ACL denial looks like: HTTP
-        # 200 with the pagination clause silently dropped. Track the sys_ids we
-        # have already seen at the page level; a page that adds nothing new means
-        # the cursor is not advancing.
+        # Guard against a server that ignores sysparm_offset and keeps serving
+        # the same page. That is what a query_range ACL denial looks like: HTTP
+        # 200 with the pagination clause silently dropped. Track the sys_ids on
+        # the previous page; a page that repeats it means the cursor is not
+        # advancing.
+        #
+        # This has to run on BOTH paths, not just the no-total_count one:
+        #
+        #  - Without a count, the only stop condition is an empty page, so a
+        #    repeated page loops forever.
+        #  - WITH a count the loop does terminate, at ceil(total/page_size)
+        #    iterations, but it emits the same page every time and exits 0. Since
+        #    targets upsert on sys_id, the destination keeps one page of a table
+        #    that may be far larger, and the run reports success. That is the
+        #    same silent truncation this module exists to prevent, and it is the
+        #    COMMON path - ServiceNow returns X-Total-Count on ordinary tables,
+        #    so total_count is normally set and the guard was normally off.
+        #
+        # No false positives either way: under healthy offset pagination
+        # consecutive pages address disjoint row ranges, so their sys_id sets
+        # cannot be equal, and an all-hidden page yields an empty signature that
+        # `and signature` already excludes.
         seen_page_signature: Optional[frozenset] = None
 
         while True:
@@ -212,11 +227,7 @@ class BaseStream(ABC):
                 signature = frozenset(
                     r.get("sys_id", "") for r in raw_records if r
                 )
-                if (
-                    total_count is None
-                    and signature
-                    and signature == seen_page_signature
-                ):
+                if signature and signature == seen_page_signature:
                     raise ServiceNowIncompleteSyncError(
                         f"Stream '{self.tap_stream_id}' stopped before the end of "
                         f"its data: the server returned the same page of "

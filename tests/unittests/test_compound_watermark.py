@@ -698,6 +698,66 @@ class TestGetRecordsPermissionErrors(unittest.TestCase):
                 emitted.append(r)
         self.assertEqual(len(emitted), 1, "the repeated page was emitted twice")
 
+    def test_repeated_page_raises_when_total_count_is_known(self):
+        """The stall guard must run on the X-Total-Count path too.
+
+        This is the COMMON path: ServiceNow returns X-Total-Count on ordinary
+        tables, so total_count is normally set. Gating the guard on
+        `total_count is None` therefore disabled it in production.
+
+        Here the loop does terminate (at ceil(total/page_size) iterations), so
+        there is no hang to notice - it just emits the same page 5 times and
+        exits 0. Targets upsert on sys_id, so the destination would keep one
+        page of a 5-page table and the run would report success.
+        """
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        client.get_total_count.return_value = 5000   # 5 pages at page_size=1000
+        # Same page at every offset: sysparm_offset is being ignored.
+        client.make_request.return_value = {
+            "result": [_record("id-1", "2024-01-01T00:00:00Z")]
+        }
+        stream = ConcreteBase(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
+        stream.page_size = 1000
+
+        from tap_servicenow.exceptions import ServiceNowIncompleteSyncError
+        emitted = []
+        with self.assertRaises(ServiceNowIncompleteSyncError) as ctx:
+            for r in stream.get_records():
+                emitted.append(r)
+
+        self.assertIn("NOT fully replicated", str(ctx.exception))
+        # Detected on the second page, before the repeat reached the target.
+        self.assertEqual(len(emitted), 1, "the repeated page was emitted twice")
+        self.assertEqual(client.make_request.call_count, 2)
+
+    def test_hidden_page_does_not_false_positive_as_a_stall(self):
+        """Consecutive all-hidden pages are not a stall.
+
+        A page whose rows are all ACL-masked yields an empty signature, which
+        carries no cursor information. Two of them in a row must NOT be read as
+        a repeated page, or every table with a wide ACL-hidden gap would fail.
+        """
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        client.get_total_count.return_value = 400
+        client.make_request.side_effect = [
+            {"result": [_record("id-1", "2024-01-01T00:00:00Z")]},  # offset=0
+            {"result": []},                                          # offset=100
+            {"result": []},                                          # offset=200
+            {"result": [_record("id-2", "2024-01-02T00:00:00Z")]},  # offset=300
+        ]
+        stream = ConcreteBase(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
+        stream.page_size = 100
+
+        records = list(stream.get_records())
+        self.assertEqual(len(records), 2)
+        self.assertEqual(client.make_request.call_count, 4)
+
     def test_no_stall_warning_on_healthy_pagination(self):
         """Healthy multi-page pagination completes without raising."""
         client = MagicMock()
