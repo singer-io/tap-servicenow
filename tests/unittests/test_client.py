@@ -178,6 +178,75 @@ class TestClient(unittest.TestCase):
             self.assertEqual(mock_get.call_count, 1)
 
 
+class TestGetTotalCount(unittest.TestCase):
+    """Tests for Client.get_total_count() — reads X-Total-Count from headers."""
+
+    def setUp(self):
+        self.client = Client(default_config)
+
+    def _resp(self, status, count_header=None):
+        headers = {}
+        if count_header is not None:
+            headers["X-Total-Count"] = str(count_header)
+        return MockResponse(status, headers=headers, raise_error=(status >= 400), text={})
+
+    def test_returns_count_from_header(self):
+        """Returns the integer value of X-Total-Count when present."""
+        with patch.object(self.client._session, "get",
+                          return_value=self._resp(200, count_header=42)):
+            result = self.client.get_total_count("https://test.example.com/incident")
+        self.assertEqual(result, 42)
+
+    def test_returns_none_when_header_absent(self):
+        """Returns None when X-Total-Count is not in the response headers."""
+        with patch.object(self.client._session, "get",
+                          return_value=self._resp(200)):
+            result = self.client.get_total_count("https://test.example.com/incident")
+        self.assertIsNone(result)
+
+    def test_raises_on_403(self):
+        """A 403 response must raise ServiceNowForbiddenError immediately."""
+        with patch.object(self.client._session, "get",
+                          return_value=self._resp(403)) as mock_get:
+            with self.assertRaises(ServiceNowForbiddenError):
+                self.client.get_total_count("https://test.example.com/incident")
+            self.assertEqual(mock_get.call_count, 1)
+
+    @patch("time.sleep")
+    def test_retries_on_429_then_succeeds(self, mock_sleep):
+        """A transient 429 is retried and does not propagate if it clears."""
+        responses = [
+            self._resp(429),
+            self._resp(200, count_header=10),
+        ]
+        with patch.object(self.client._session, "get", side_effect=responses) as mock_get:
+            result = self.client.get_total_count("https://test.example.com/incident")
+        self.assertEqual(result, 10)
+        self.assertEqual(mock_get.call_count, 2)
+
+    def test_probe_uses_limit_1_and_no_count_absent(self):
+        """Probe must request sysparm_limit=1 and NOT include sysparm_no_count.
+
+        sysparm_no_count suppresses X-Total-Count; it must be absent from the
+        probe request even when it appears in the stream's base params.
+        """
+        captured_params = {}
+
+        def capture(url, **kwargs):
+            captured_params.update(kwargs.get("params", {}))
+            return self._resp(200, count_header=5)
+
+        with patch.object(self.client._session, "get", side_effect=capture):
+            self.client.get_total_count(
+                "https://test.example.com/incident",
+                params={"sysparm_no_count": "true", "sysparm_query": "active=true"},
+            )
+
+        self.assertEqual(captured_params.get("sysparm_limit"), 1)
+        self.assertEqual(captured_params.get("sysparm_offset"), 0)
+        self.assertNotIn("sysparm_no_count", captured_params)
+
+
 class TestRetryWaitSchedule(unittest.TestCase):
     """The wait between retries: Retry-After exactly, expo otherwise.
 
