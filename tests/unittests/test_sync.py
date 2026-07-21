@@ -223,6 +223,62 @@ class TestSyncPermissionErrorIsolation(unittest.TestCase):
     @patch("singer.Transformer")
     @patch("singer.write_state")
     @patch("tap_servicenow.streams.abstracts.IncrementalStream.sync")
+    def test_mixed_failures_name_both_categories(self, mock_sync, *_):
+        """A run with stranded AND forbidden streams must report both.
+
+        Raising on whichever list was checked first dropped the other from the
+        exception, so an operator saw half the problem and fixed half of it.
+        """
+        mock_sync.side_effect = [
+            ServiceNowIncompleteSyncError("alpha stalled"),
+            ServiceNowForbiddenError("403 Forbidden"),
+            7,
+        ]
+
+        with self.assertRaises(ServiceNowIncompleteSyncError) as ctx:
+            sync(MagicMock(), {}, self._catalog("alpha", "beta", "gamma"), {})
+
+        message = str(ctx.exception)
+        self.assertIn("alpha", message)               # the stranded stream
+        self.assertIn("beta", message)                # the forbidden stream
+        self.assertNotIn("gamma", message)            # gamma synced fine
+        self.assertIn("did not replicate fully", message)
+        self.assertIn("lacks 'read' access", message)
+        # Both attempted after the first failure, and gamma still ran.
+        self.assertEqual(mock_sync.call_count, 3)
+
+    @patch("singer.write_schema")
+    @patch("singer.get_currently_syncing")
+    @patch("singer.Transformer")
+    @patch("singer.write_state")
+    @patch("tap_servicenow.streams.abstracts.IncrementalStream.sync")
+    def test_forbidden_only_run_does_not_mention_incomplete(self, mock_sync, *_):
+        """The combined message must not imply failures that did not happen."""
+        mock_sync.side_effect = [ServiceNowForbiddenError("403 Forbidden"), 5]
+
+        with self.assertRaises(ServiceNowForbiddenError) as ctx:
+            sync(MagicMock(), {}, self._catalog("alpha", "beta"), {})
+
+        self.assertNotIn("did not replicate fully", str(ctx.exception))
+
+    @patch("singer.write_schema")
+    @patch("singer.get_currently_syncing")
+    @patch("singer.Transformer")
+    @patch("singer.write_state")
+    @patch("tap_servicenow.streams.abstracts.IncrementalStream.sync")
+    def test_incomplete_only_run_does_not_mention_permissions(self, mock_sync, *_):
+        mock_sync.side_effect = [ServiceNowIncompleteSyncError("alpha stalled"), 5]
+
+        with self.assertRaises(ServiceNowIncompleteSyncError) as ctx:
+            sync(MagicMock(), {}, self._catalog("alpha", "beta"), {})
+
+        self.assertNotIn("lacks 'read' access", str(ctx.exception))
+
+    @patch("singer.write_schema")
+    @patch("singer.get_currently_syncing")
+    @patch("singer.Transformer")
+    @patch("singer.write_state")
+    @patch("tap_servicenow.streams.abstracts.IncrementalStream.sync")
     def test_no_raise_when_every_stream_succeeds(self, mock_sync, *_):
         mock_sync.side_effect = [1, 2]
         sync(MagicMock(), {}, self._catalog("alpha", "beta"), {})
