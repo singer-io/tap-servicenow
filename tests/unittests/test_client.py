@@ -4,7 +4,19 @@ from unittest.mock import patch
 from parameterized import parameterized
 from requests.exceptions import Timeout, ConnectionError, ChunkedEncodingError
 from tap_servicenow.client import Client
-from tap_servicenow.exceptions import *
+from tap_servicenow.exceptions import (
+    ServiceNowBadGatewayError,
+    ServiceNowBadRequestError,
+    ServiceNowConflictError,
+    ServiceNowForbiddenError,
+    ServiceNowInternalServerError,
+    ServiceNowNotFoundError,
+    ServiceNowNotImplementedError,
+    ServiceNowRateLimitError,
+    ServiceNowServiceUnavailableError,
+    ServiceNowUnauthorizedError,
+    ServiceNowUnprocessableEntityError,
+)
 
 
 default_config = {
@@ -113,9 +125,9 @@ class TestClient(unittest.TestCase):
     ])
     @patch("time.sleep")
     def test_make_request_other_failure_with_retry(self, test_name, error, mock_sleep):
-        
+
         with patch.object(self.client._session, "request", side_effect=error) as mock_request:
-            with self.assertRaises(error) as e:
+            with self.assertRaises(error):
                 self.client._Client__make_request("GET", "https://api.example.com/resource")
 
             self.assertEqual(mock_request.call_count, 5)
