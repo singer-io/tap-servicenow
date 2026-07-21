@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 from tap_servicenow.exceptions import (
     ServiceNowForbiddenError,
+    ServiceNowIncompleteSyncError,
     ServiceNowNotFoundError,
     ServiceNowUnauthorizedError,
 )
@@ -160,7 +161,7 @@ class TestSyncPermissionErrorIsolation(unittest.TestCase):
         mock_sync.side_effect = [
             ServiceNowForbiddenError("403 Forbidden"),
             5,
-            ServiceNowUnauthorizedError("401 Unauthorized"),
+            ServiceNowForbiddenError("403 Forbidden"),
         ]
 
         with self.assertRaises(ServiceNowForbiddenError) as ctx:
@@ -171,6 +172,51 @@ class TestSyncPermissionErrorIsolation(unittest.TestCase):
         self.assertIn("gamma", message)
         self.assertNotIn("beta", message)   # beta synced fine
         self.assertIn("2 of 3", message)
+
+    @patch("singer.write_schema")
+    @patch("singer.get_currently_syncing")
+    @patch("singer.Transformer")
+    @patch("singer.write_state")
+    @patch("tap_servicenow.streams.abstracts.IncrementalStream.sync")
+    def test_401_aborts_immediately_instead_of_being_collected(
+        self, mock_sync, *_
+    ):
+        """A dead credential is not a per-table condition.
+
+        403 means "not this table"; 401 means the credentials are invalid, so
+        every remaining stream would fail identically. Grinding through a
+        1,700-stream catalog to collect the same error 1,700 times helps nobody.
+        """
+        mock_sync.side_effect = [
+            ServiceNowUnauthorizedError("401 Unauthorized"),
+            5,
+            5,
+        ]
+
+        with self.assertRaises(ServiceNowUnauthorizedError):
+            sync(MagicMock(), {}, self._catalog("alpha", "beta", "gamma"), {})
+
+        # Stopped on the first stream; beta and gamma were never attempted.
+        self.assertEqual(mock_sync.call_count, 1)
+
+    @patch("singer.write_schema")
+    @patch("singer.get_currently_syncing")
+    @patch("singer.Transformer")
+    @patch("singer.write_state")
+    @patch("tap_servicenow.streams.abstracts.IncrementalStream.sync")
+    def test_incomplete_stream_isolated_and_named(self, mock_sync, *_):
+        """A stranded stream must not cost the others, but must fail the run."""
+        mock_sync.side_effect = [
+            ServiceNowIncompleteSyncError("alpha stalled"),
+            5,
+        ]
+
+        with self.assertRaises(ServiceNowIncompleteSyncError) as ctx:
+            sync(MagicMock(), {}, self._catalog("alpha", "beta"), {})
+
+        self.assertEqual(mock_sync.call_count, 2)      # beta still ran
+        self.assertIn("alpha", str(ctx.exception))
+        self.assertIn("did not replicate fully", str(ctx.exception))
 
     @patch("singer.write_schema")
     @patch("singer.get_currently_syncing")

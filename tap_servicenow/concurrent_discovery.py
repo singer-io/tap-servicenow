@@ -16,7 +16,11 @@ import singer
 from singer import metadata
 
 from tap_servicenow.datetime_utils import to_snow_dt
-from tap_servicenow.exceptions import ServiceNowForbiddenError, ServiceNowUnauthorizedError
+from tap_servicenow.exceptions import (
+    ServiceNowForbiddenError,
+    ServiceNowIncompleteSyncError,
+    ServiceNowUnauthorizedError,
+)
 from tap_servicenow.streams import servicenow_type_to_json_type
 
 LOGGER = singer.get_logger()
@@ -185,9 +189,32 @@ class ServiceNowDictionaryFetcher(ConcurrentDiscovery):
             # applies row-level ACLs AFTER the query here too: a short page does
             # NOT mean the chunk is exhausted (KB0727636). Stop only on an empty
             # page, matching get_all_tables, BaseStream.get_records and
-            # IncrementalStream.sync. The cursor-stall check prevents an infinite
-            # loop if a page carries no advanceable sys_id.
-            if not rows or last_sys_id == prev_sys_id:
+            # IncrementalStream.sync.
+            if not rows:
+                break
+
+            # A page that does not advance the cursor strands us: the next
+            # request would repeat this one. Returning `partial` would hand back
+            # a TRUNCATED field map, and those columns then go missing from the
+            # catalog and the destination with no error anywhere - the exact
+            # failure the raise above exists to prevent, reached without an
+            # exception, so FAIL_FAST cannot catch it either.
+            #
+            # Only escalate when the page came back FULL, which is the case
+            # where more rows certainly remain and we have no way to reach them.
+            # A short page carrying no usable cursor is the end of the chunk
+            # (sys_dictionary rows are not ACL-filtered the way data rows are,
+            # and every row carries sys_id because we request it explicitly).
+            if last_sys_id == prev_sys_id:
+                if len(rows) >= self.dict_page_size:
+                    raise ServiceNowIncompleteSyncError(
+                        f"sys_dictionary paging stalled at sys_id "
+                        f"'{last_sys_id}' after {pages_fetched} full page(s) "
+                        f"for chunk starting {chunk[:3]!r}. More rows remain "
+                        f"but the cursor cannot advance, so the field map for "
+                        f"these tables would be incomplete. Failing discovery "
+                        f"rather than emitting a truncated schema."
+                    )
                 break
         return partial
 
@@ -246,52 +273,64 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
         # Shared state — protected by locks
         self._resolve_cache: Dict[str, Dict] = {}
         self._cache_lock = threading.Lock()
-        self._key_locks: Dict[str, threading.Lock] = {}
         self.unauthorized_tables: List[str] = []
+        #: (table, error) for tables dropped by something OTHER than a
+        #: permission denial. Kept separate so a transient failure is never
+        #: reported to the operator as "you lack access".
+        self.errored_tables: List[Tuple[str, str]] = []
         self._unauth_lock = threading.Lock()
 
-    def _resolve_fields(
-        self,
-        table_name: str,
-        _visiting: Optional[frozenset] = None,
-    ) -> Dict:
-        """Walk the super_class chain and merge all inherited fields into the table's schema."""
-        # Cycle guard — must run before acquiring the per-key lock; otherwise a
-        # cyclic inheritance chain (A→B→A) would cause the same thread to try to
-        # re-acquire a non-reentrant Lock it already holds → deadlock.
-        visiting = _visiting or frozenset()
-        if table_name in visiting:
-            return {}
-        visiting = visiting | {table_name}
+    def _resolve_fields(self, table_name: str) -> Dict:
+        """Merge a table's own fields with everything it inherits via super_class.
 
-        # Check cache and atomically create the per-key lock under _cache_lock
+        Walks the inheritance chain iteratively and takes no locks while doing
+        so. `table_map` and `field_map` are built before the thread pool starts
+        and are read-only from here, so the walk needs no synchronization.
+
+        The previous version recursed while holding a per-table lock, which
+        deadlocked across threads on a cyclic chain: with A->B->A, a thread
+        entering at A holds lock[A] and wants lock[B] while a thread entering
+        at B holds lock[B] and wants lock[A]. Classic ABBA, and since
+        ThreadPoolExecutor has no timeout, discovery hung forever with no
+        output. The old `_visiting` guard could not prevent it - it was a
+        per-call-chain frozenset, so it only stopped a thread from re-entering
+        its own chain, never two threads from blocking each other.
+
+        Resolving iteratively also makes the result deterministic. Under the
+        old scheme a cycle produced different schemas depending on which thread
+        cached first.
+        """
+        # Chain is [table, parent, grandparent, ...]; `seen` breaks any cycle.
+        chain: List[str] = []
+        seen = set()
+        current = table_name
+        while current and current not in seen:
+            seen.add(current)
+            chain.append(current)
+            current = self.table_map.get(current, "")
+
+        if current:
+            # Loop exited because we came back to a table already in the chain.
+            LOGGER.warning(
+                "Cyclic super_class chain detected at table '%s' (chain: %s). "
+                "Breaking the cycle; inherited fields may be incomplete.",
+                current, " -> ".join(chain),
+            )
+
         with self._cache_lock:
             if table_name in self._resolve_cache:
                 return self._resolve_cache[table_name]
-            if table_name not in self._key_locks:
-                self._key_locks[table_name] = threading.Lock()
-            key_lock = self._key_locks[table_name]
 
-        # Acquire the per-key lock — only threads computing THIS table block here
-        with key_lock:
-            # Double-check: another thread may have computed it while we waited
-            with self._cache_lock:
-                if table_name in self._resolve_cache:
-                    return self._resolve_cache[table_name]
+        # Merge root-first so a child's own definition overrides its parent's.
+        merged: Dict = {}
+        for name in reversed(chain):
+            merged.update(self.field_map.get(name, {}))
 
-            # Now we are the sole thread computing this table
-
-            own_fields = self.field_map.get(table_name, {}).copy()
-            super_class = self.table_map.get(table_name, "")
-            if super_class:
-                parent_fields = self._resolve_fields(super_class, visiting)
-                merged = {**parent_fields, **own_fields}   # child overrides parent
-            else:
-                merged = own_fields
-
-            with self._cache_lock:
-                self._resolve_cache[table_name] = merged
-            return merged
+        with self._cache_lock:
+            # Another thread may have computed the same value concurrently.
+            # Both results are identical, so either is fine to keep.
+            self._resolve_cache.setdefault(table_name, merged)
+            return self._resolve_cache[table_name]
 
     def process_item(self, table: str) -> Optional[Dict]:
         """Build the Singer schema and metadata for one ServiceNow table and verify API access."""
@@ -343,11 +382,25 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
                     ),
                 )
             except (ServiceNowForbiddenError, ServiceNowUnauthorizedError):
+                # A real permission answer: this table is deliberately excluded
+                # from the catalog, and schema.py reports the whole set.
                 with self._unauth_lock:
                     self.unauthorized_tables.append(table)
                 return None
             except Exception as exc:
-                LOGGER.warning("Error accessing table '%s': %s", table, exc)
+                # NOT a permission answer - a 5xx that exhausted its retries, a
+                # timeout, a malformed response. Dropping the table here made a
+                # transient outage look identical to "the account cannot read
+                # this", and because it was never recorded as unauthorized,
+                # schema.py's all-tables-blocked check never fired either. The
+                # table simply vanished from the catalog, and any stream the
+                # customer had selected silently stopped being replicated.
+                with self._unauth_lock:
+                    self.errored_tables.append((table, str(exc)))
+                LOGGER.error(
+                    "Error accessing table '%s' (not a permission error): %s. "
+                    "Excluding it from this catalog.", table, exc
+                )
                 return None
 
             mdata = metadata.get_standard_metadata(
@@ -369,6 +422,10 @@ class ServiceNowTableSchemaBuilder(ConcurrentDiscovery):
             }
 
         except Exception as exc:
+            # Same reasoning as the probe's catch-all above: record it so the
+            # caller can tell "excluded on purpose" from "broke while building".
+            with self._unauth_lock:
+                self.errored_tables.append((table, str(exc)))
             LOGGER.error("Failed to build schema for table '%s': %s", table, exc)
             return None
 

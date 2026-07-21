@@ -675,3 +675,64 @@ class TestGetRecordsPermissionErrors(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestUncursorableRecords(unittest.TestCase):
+    """Records missing the replication key or sys_id cannot position the cursor.
+
+    The old code substituted the bookmark for a missing sys_updated_on, which
+    drove the cursor BACKWARDS: the next query rewound to the start of the
+    range and re-served the same page, so the stream never advanced and re-read
+    the same rows on every future run. Field-level ACLs make this reachable -
+    ServiceNow answers with HTTP 200 and the field simply omitted.
+    """
+
+    def _sync(self, pages):
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        client.make_request.side_effect = pages
+        stream = ConcreteIncremental(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/test_stream"
+        written = []
+        with patch("tap_servicenow.streams.abstracts.get_bookmark", return_value="2024-01-01T00:00:00Z"):
+            with patch("tap_servicenow.streams.abstracts.write_bookmark",
+                       side_effect=lambda s, st, k, v: written.append(v) or s):
+                with patch("tap_servicenow.streams.abstracts.singer.write_state"):
+                    with singer.Transformer() as t:
+                        count = stream.sync(state={}, transformer=t)
+        return client, written, count
+
+    def test_record_without_replication_key_does_not_rewind_cursor(self):
+        """A blank sys_updated_on must be skipped, not substituted."""
+        client, written, _ = self._sync([
+            {"result": [
+                _record("id-1", "2024-02-01T00:00:00Z"),
+                {"sys_id": "id-2", "sys_updated_on": ""},   # unreadable field
+            ]},
+            {"result": []},
+        ])
+        # The cursor must sit on id-1, NOT be rewound to the bookmark.
+        second_query = client.make_request.call_args_list[1][0][2]["sysparm_query"]
+        self.assertIn("2024-02-01 00:00:00", second_query)
+        self.assertEqual(written, ["2024-02-01 00:00:00"])
+
+    def test_record_without_sys_id_is_skipped(self):
+        client, written, _ = self._sync([
+            {"result": [
+                _record("id-1", "2024-02-01T00:00:00Z"),
+                {"sys_updated_on": "2024-02-02T00:00:00Z"},   # no sys_id
+            ]},
+            {"result": []},
+        ])
+        self.assertEqual(written, ["2024-02-01 00:00:00"])
+
+    def test_page_of_only_uncursorable_records_is_a_stall(self):
+        """If nothing on the page can position the cursor, we are stranded."""
+        from tap_servicenow.exceptions import ServiceNowIncompleteSyncError
+        with self.assertRaises(ServiceNowIncompleteSyncError):
+            self._sync([
+                {"result": [_record("id-1", "2024-02-01T00:00:00Z")]},
+                {"result": [{"sys_id": "id-2", "sys_updated_on": ""}]},
+                {"result": []},
+            ])

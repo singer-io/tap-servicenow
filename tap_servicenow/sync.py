@@ -116,11 +116,22 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
                 update_currently_syncing(state, None)
                 continue
 
-            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
-                # The stream raised before writing its bookmark, so nothing was
-                # advanced past rows we never fetched. Record it and move on.
-                # The exception already carries the stream and endpoint, so this
-                # only adds what happens next.
+            except ServiceNowUnauthorizedError:
+                # 401 means the credentials themselves are dead, not that this
+                # one table is off limits. Every remaining stream would fail
+                # identically, so grinding through a 1,700-stream catalog to
+                # collect the same error 1,700 times helps nobody. Abort now.
+                LOGGER.critical(
+                    "Authentication failed while syncing stream '%s'. The "
+                    "credentials are invalid or expired - aborting the run "
+                    "rather than retrying every remaining stream.", stream_name
+                )
+                raise
+
+            except ServiceNowForbiddenError as e:
+                # 403 is per-table: this account cannot read THIS table, but
+                # the others may be fine. The stream raised before writing its
+                # bookmark, so nothing advanced past rows we never fetched.
                 LOGGER.critical("%s Continuing with the remaining streams.", e)
                 permission_failures.append(stream_name)
                 update_currently_syncing(state, None)

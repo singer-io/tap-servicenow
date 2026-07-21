@@ -358,6 +358,7 @@ class IncrementalStream(BaseStream):
 
         with metrics.record_counter(self.tap_stream_id) as counter:
             empty_record_count = 0
+            skipped_uncursorable = 0
             # Keyset cursor: track the last (sys_updated_on, sys_id) seen so we
             # can advance the query on every page without using offset pagination.
             last_page_dt: str = ""
@@ -419,8 +420,22 @@ class IncrementalStream(BaseStream):
 
                         record = self.modify_object(record, parent_obj)
 
-                        record_dt: str = to_snow_dt(record.get(replication_key) or bookmark_dt)
+                        raw_dt = record.get(replication_key)
                         record_sid: str = record.get("sys_id", "")
+
+                        # A record with no replication key cannot position the
+                        # cursor. Substituting bookmark_dt (the old behavior)
+                        # drove last_page_dt BACKWARDS to the bookmark, so the
+                        # next query rewound to the start of the range and
+                        # re-served the same page - the stream never advanced
+                        # and re-read the same rows on every future run. This
+                        # is reachable: field-level ACLs answer with HTTP 200
+                        # and the field simply omitted.
+                        if not raw_dt or not record_sid:
+                            skipped_uncursorable += 1
+                            continue
+
+                        record_dt: str = to_snow_dt(raw_dt)
 
                         # Advance the keyset cursor to the last record on this page
                         last_page_dt = record_dt
@@ -492,6 +507,15 @@ class IncrementalStream(BaseStream):
                         "Stream '%s' encountered %d empty records "
                         "(possibly due to missing data-level permissions).",
                         self.tap_stream_id, empty_record_count
+                    )
+
+                if skipped_uncursorable > 0:
+                    LOGGER.warning(
+                        "Stream '%s' skipped %d record(s) missing '%s' or "
+                        "'sys_id'. Those fields position the keyset cursor, so "
+                        "such records cannot be replicated incrementally - "
+                        "usually a field-level ACL hiding them.",
+                        self.tap_stream_id, skipped_uncursorable, replication_key
                     )
 
                 if cursor_stalled:

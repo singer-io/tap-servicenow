@@ -8,6 +8,7 @@ Unit tests for:
       - performance params on access-check requests
 """
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 from tap_servicenow.schema import get_dynamic_schema
@@ -17,7 +18,10 @@ from tap_servicenow.concurrent_discovery import (
     ServiceNowDictionaryFetcher,
     ServiceNowTableSchemaBuilder,
 )
-from tap_servicenow.exceptions import ServiceNowForbiddenError
+from tap_servicenow.exceptions import (
+    ServiceNowForbiddenError,
+    ServiceNowServiceUnavailableError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -590,3 +594,97 @@ class TestDictionaryFetcherPagination(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Inheritance resolution: thread safety and cycles
+# ---------------------------------------------------------------------------
+
+class TestResolveFieldsConcurrency(unittest.TestCase):
+    """_resolve_fields walks the super_class chain under a thread pool.
+
+    The previous implementation recursed while holding a per-table lock, which
+    deadlocked across threads on a cyclic chain (A->B->A): one thread holds
+    lock[A] wanting lock[B] while another holds lock[B] wanting lock[A].
+    ThreadPoolExecutor has no timeout, so discovery hung forever with no output.
+    """
+
+    @staticmethod
+    def _builder(table_map, field_map):
+        return ServiceNowTableSchemaBuilder(
+            MagicMock(), field_map, table_map, max_workers=4
+        )
+
+    def test_cyclic_chain_does_not_deadlock(self):
+        builder = self._builder({"A": "B", "B": "A"},
+                                {"A": {"f_a": {}}, "B": {"f_b": {}}})
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(builder._resolve_fields, t)
+                       for t in ["A", "B", "A", "B"]]
+            # A deadlock shows up as TimeoutError here rather than a hang.
+            results = [f.result(timeout=10) for f in futures]
+        self.assertTrue(all(r for r in results))
+
+    def test_cyclic_chain_is_deterministic(self):
+        """A cycle used to yield different schemas depending on cache order."""
+        builder = self._builder({"A": "B", "B": "A"},
+                                {"A": {"f_a": {}}, "B": {"f_b": {}}})
+        self.assertEqual(sorted(builder._resolve_fields("A")), ["f_a", "f_b"])
+        self.assertEqual(sorted(builder._resolve_fields("B")), ["f_a", "f_b"])
+
+    def test_child_overrides_parent(self):
+        """Merge order must stay root-first so the child definition wins."""
+        builder = self._builder(
+            {"child": "parent", "parent": ""},
+            {"parent": {"shared": "PARENT", "only_parent": {}},
+             "child": {"shared": "CHILD"}},
+        )
+        resolved = builder._resolve_fields("child")
+        self.assertEqual(resolved["shared"], "CHILD")
+        self.assertIn("only_parent", resolved)
+
+    def test_deep_chain_resolves_fully(self):
+        builder = self._builder(
+            {"d": "c", "c": "b", "b": "a", "a": ""},
+            {"a": {"fa": {}}, "b": {"fb": {}}, "c": {"fc": {}}, "d": {"fd": {}}},
+        )
+        self.assertEqual(sorted(builder._resolve_fields("d")),
+                         ["fa", "fb", "fc", "fd"])
+
+
+class TestErroredVsUnauthorizedTables(unittest.TestCase):
+    """A transient failure must not be reported as a permission problem.
+
+    Dropping a table on any exception made an outage look identical to "the
+    account cannot read this", and because it was never recorded as
+    unauthorized, schema.py's all-tables-blocked check never fired either. The
+    table just vanished from the catalog.
+    """
+
+    @staticmethod
+    def _builder(client):
+        return ServiceNowTableSchemaBuilder(
+            client, {"incident": {"sys_id": {}, "sys_updated_on": {}}},
+            {"incident": ""}, max_workers=1,
+        )
+
+    def test_permission_error_recorded_as_unauthorized(self):
+        client = MagicMock()
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        client.get.side_effect = ServiceNowForbiddenError("403")
+        builder = self._builder(client)
+
+        self.assertIsNone(builder.process_item("incident"))
+        self.assertEqual(builder.unauthorized_tables, ["incident"])
+        self.assertEqual(builder.errored_tables, [])
+
+    def test_transient_error_recorded_separately(self):
+        client = MagicMock()
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        client.get.side_effect = ServiceNowServiceUnavailableError("503")
+        builder = self._builder(client)
+
+        self.assertIsNone(builder.process_item("incident"))
+        self.assertEqual(builder.unauthorized_tables, [],
+                         "a 503 is not a permission answer")
+        self.assertEqual([t for t, _ in builder.errored_tables], ["incident"])
