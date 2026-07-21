@@ -170,7 +170,7 @@ class Client:
             timeout=self.request_timeout,
         )
         raise_for_error(response)
-        count_str = response.headers.get("X-Total-Count", "")
+        count_str = (response.headers.get("X-Total-Count") or "").strip()
         return int(count_str) if count_str.isdigit() else None
 
     @RETRY_ON_TRANSIENT
