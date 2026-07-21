@@ -13,8 +13,7 @@ from singer import (
     metadata
 )
 
-from datetime import timezone
-import dateutil.parser
+from tap_servicenow.datetime_utils import to_snow_dt
 from tap_servicenow.exceptions import (
     ServiceNowError,
     ServiceNowForbiddenError,
@@ -26,17 +25,7 @@ def _to_snow_dt(value: str) -> str:
     """
     Normalise any datetime string to ServiceNow's native format
     """
-    if not value:
-        return value
-    try:
-        dt = dateutil.parser.parse(value)
-        # Treat naive datetimes as UTC
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(timezone.utc)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return value
+    return to_snow_dt(value)
 
 LOGGER = get_logger()
 

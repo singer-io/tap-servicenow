@@ -15,8 +15,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import singer
 from singer import metadata
 
+from tap_servicenow.datetime_utils import to_snow_dt
 from tap_servicenow.exceptions import ServiceNowForbiddenError, ServiceNowUnauthorizedError
-from tap_servicenow.streams.abstracts import _to_snow_dt
 from tap_servicenow.streams import servicenow_type_to_json_type
 
 LOGGER = singer.get_logger()
@@ -32,7 +32,7 @@ def _build_access_probe_params(has_replication_key: bool, start_date: Optional[s
     if not has_replication_key:
         return params
 
-    bookmark_dt = _to_snow_dt(start_date)
+    bookmark_dt = to_snow_dt(start_date or "")
     if bookmark_dt:
         params["sysparm_query"] = (
             f"sys_updated_on>={bookmark_dt}"
