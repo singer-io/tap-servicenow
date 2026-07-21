@@ -273,16 +273,34 @@ class TestIncrementalSync(unittest.TestCase):
         self.assertEqual(count, 1)  # only 1 non-empty record emitted
         self.assertFalse(any(r == {} for r in written))
 
-    def test_returns_zero_on_exception(self):
-        """sync must catch ServiceNow API errors, log critical, and return 0.
-        Non-ServiceNow errors (programming bugs) must propagate.
-        """
+    def test_raises_on_permission_exception(self):
+        """sync must fail fast on permission errors (401/403)."""
         from tap_servicenow.exceptions import ServiceNowForbiddenError
         client = MagicMock()
         client.base_url = "https://test.service-now.com/api/now/table"
         client.config = {"start_date": "2024-01-01T00:00:00Z"}
-        # Simulate a 403 that exhausted retries — a ServiceNowError subclass
+        # Simulate a 403 permission failure.
         client.make_request.side_effect = ServiceNowForbiddenError("403 Forbidden")
+
+        stream = ConcreteIncremental(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/test_stream"
+
+        with patch("tap_servicenow.streams.abstracts.get_bookmark", return_value="2024-01-01T00:00:00Z"):
+            with patch("tap_servicenow.streams.abstracts.write_bookmark", side_effect=lambda s, st, k, v: s):
+                with patch("tap_servicenow.streams.abstracts.singer.write_state"):
+                    with singer.Transformer() as t:
+                        with self.assertRaises(ServiceNowForbiddenError) as ctx:
+                            stream.sync(state={}, transformer=t)
+
+        self.assertIn("Permission error while syncing stream 'test_stream'", str(ctx.exception))
+
+    def test_returns_zero_on_non_permission_servicenow_error(self):
+        """Non-permission ServiceNow errors should still be logged and skipped."""
+        from tap_servicenow.exceptions import ServiceNowNotFoundError
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        client.make_request.side_effect = ServiceNowNotFoundError("404 Not Found")
 
         stream = ConcreteIncremental(client, _make_catalog())
         stream.url_endpoint = "https://test.service-now.com/api/now/table/test_stream"

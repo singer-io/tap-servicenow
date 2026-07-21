@@ -451,8 +451,8 @@ class IncrementalStream(BaseStream):
                     )
                 return counter.value
 
-            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
-                _raise_permission_error(e, self.tap_stream_id, self.url_endpoint)
+            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError):
+                raise
 
             except ServiceNowError as e:
                 # A ServiceNow API error that exhausted retries or is non-retryable
