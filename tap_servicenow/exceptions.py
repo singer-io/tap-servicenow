@@ -8,8 +8,49 @@ class ServiceNowError(Exception):
 
 
 class ServiceNowBackoffError(ServiceNowError):
-    """class representing backoff error handling."""
+    """Base for retryable errors; parses the Retry-After header if present.
+
+    ServiceNow sends Retry-After on 429 and also on 503 during instance
+    maintenance, so the parsing lives here rather than on the 429 subclass.
+    """
+
+    def __init__(self, message=None, response=None):
+        self.retry_after = _parse_retry_after(response)
+        super().__init__(message, response=response)
+
+
+def _parse_retry_after(response):
+    """Seconds from a Retry-After header, or None.
+
+    `response is not None` matters: requests.Response.__bool__ returns
+    self.ok, so every error response is falsy. A truthiness check here
+    silently discarded the header on exactly the 429s and 503s it exists to
+    read, and the tap fell back to exponential backoff while claiming to
+    honor the server's instruction.
+    """
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    raw_retry = headers.get("Retry-After")
+    if not raw_retry:
+        return None
+    try:
+        # Retry-After may also be an HTTP-date, which we do not parse; falling
+        # back to exponential is correct there.
+        return int(raw_retry)
+    except (TypeError, ValueError):
+        return None
+
+class ServiceNowIncompleteSyncError(ServiceNowError):
+    """A stream stopped before reaching the end of its data.
+
+    Raised when the keyset cursor cannot advance while pages remain, so the
+    tap has no way to reach the rest of the table. Not an HTTP error: the
+    requests succeeded, which is what makes it dangerous - without this the
+    stream returns a short record set that looks like a completed sync.
+    """
     pass
+
 
 class ServiceNowBadRequestError(ServiceNowError):
     """class representing 400 status code."""
@@ -45,27 +86,12 @@ class ServiceNowUnprocessableEntityError(ServiceNowError):
 class ServiceNowRateLimitError(ServiceNowBackoffError):
     """class representing 429 status code."""
     def __init__(self, message=None, response=None):
-        """Initialize the ServiceNowRateLimitError. Parses the 'Retry-After' header from the response (if present) and sets the
-            `retry_after` attribute accordingly.
-        """
-        self.response = response
-
-        # Retry-After header parsing
-        retry_after = None
-        if response and hasattr(response, 'headers'):
-            raw_retry = response.headers.get('Retry-After')
-            if raw_retry:
-                try:
-                    retry_after = int(raw_retry)
-                except ValueError:
-                    retry_after = None
-
-        self.retry_after = retry_after
+        """Annotates the message with the Retry-After delay when one was sent."""
+        retry_after = _parse_retry_after(response)
         base_msg = message or "Rate limit hit"
-        retry_info = f"(Retry after {self.retry_after} seconds.)" \
-            if self.retry_after is not None else "(Retry after unknown delay.)"
-        full_message = f"{base_msg} {retry_info}"
-        super().__init__(full_message, response=response)
+        retry_info = f"(Retry after {retry_after} seconds.)" \
+            if retry_after is not None else "(Retry after unknown delay.)"
+        super().__init__(f"{base_msg} {retry_info}", response=response)
 
 class ServiceNowInternalServerError(ServiceNowBackoffError):
     """class representing 500 status code."""

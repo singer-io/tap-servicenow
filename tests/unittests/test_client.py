@@ -5,6 +5,7 @@ import requests
 from unittest.mock import patch
 from parameterized import parameterized
 from requests.exceptions import Timeout, ConnectionError, ChunkedEncodingError
+from tap_servicenow.datetime_utils import InvalidDatetimeError, to_snow_dt
 from tap_servicenow.client import (
     Client,
     MAX_BACKOFF_SECONDS,
@@ -50,6 +51,15 @@ class MockResponse:
         self.raise_error = raise_error
         self.text = text
         self.reason = "error"
+
+    def __bool__(self):
+        """Mirror requests.Response.__bool__, which returns self.ok.
+
+        Without this the double is truthy for 4xx/5xx while the real object is
+        falsy, so a `if response:` guard passes here and fails in production.
+        That is exactly how the Retry-After parsing bug survived a green suite.
+        """
+        return self.status_code < 400
 
     def raise_for_status(self):
         """If an error occur, this method returns a HTTPError object.
@@ -188,6 +198,48 @@ class TestRetryWaitSchedule(unittest.TestCase):
                 always_fails()
         return slept
 
+    @staticmethod
+    def _real_response(status_code, retry_after=None):
+        """A genuine requests.Response, not a double.
+
+        requests.Response.__bool__ returns self.ok, so every error response is
+        falsy. A `if response:` guard therefore discards the Retry-After header
+        on exactly the 429s and 503s it exists to read. The test doubles in this
+        module are truthy unless they mirror that, so this asserts against the
+        real object.
+        """
+        resp = requests.Response()
+        resp.status_code = status_code
+        if retry_after is not None:
+            resp.headers["Retry-After"] = str(retry_after)
+        return resp
+
+    def test_retry_after_parsed_from_real_falsy_response(self):
+        """The header must survive a response object that is falsy."""
+        resp = self._real_response(429, 60)
+        self.assertFalse(bool(resp))          # documents the trap
+        self.assertEqual(ServiceNowRateLimitError("429", resp).retry_after, 60)
+
+    def test_retry_after_parsed_on_5xx_too(self):
+        """ServiceNow sends Retry-After on 503 during instance maintenance."""
+        resp = self._real_response(503, 120)
+        self.assertEqual(
+            ServiceNowServiceUnavailableError("503", resp).retry_after, 120
+        )
+
+    def test_retry_after_absent_or_unparseable_falls_back(self):
+        """No header, or an HTTP-date we do not parse, must not blow up."""
+        self.assertIsNone(ServiceNowRateLimitError("429", self._real_response(429)).retry_after)
+        bad = self._real_response(429)
+        bad.headers["Retry-After"] = "Wed, 21 Oct 2026 07:28:00 GMT"
+        self.assertIsNone(ServiceNowRateLimitError("429", bad).retry_after)
+        self.assertIsNone(ServiceNowRateLimitError("429", None).retry_after)
+
+    def test_real_429_response_sleeps_exactly_retry_after(self):
+        """End-to-end: a real falsy 429 must drive the wait, not expo."""
+        waits = self._waits(lambda: ServiceNowRateLimitError("429", self._real_response(429, 60)))
+        self.assertEqual(waits, [60.0, 60.0, 60.0, 60.0])
+
     def test_retry_after_is_honored_exactly(self):
         """A Retry-After of 60 must wait 60 - not 62, and not uniform(0, 60)."""
         def rate_limited():
@@ -238,3 +290,53 @@ class TestRetryWaitSchedule(unittest.TestCase):
             self.assertLessEqual(wait, bound)
         # B's first wait is bounded by 2, not by A's fourth step (16).
         self.assertLessEqual(first_b, 2)
+
+
+class TestDatetimeNormalization(unittest.TestCase):
+    """to_snow_dt guards the values that go into sysparm_query.
+
+    An unparseable config or bookmark value used to pass through unchanged,
+    producing `sys_updated_on>=<garbage>`. ServiceNow answers that with HTTP
+    200 and either zero rows or the condition ignored - silently wrong.
+    """
+
+    def test_normalizes_to_servicenow_format(self):
+        self.assertEqual(to_snow_dt("2024-02-01T12:34:56Z"), "2024-02-01 12:34:56")
+
+    def test_naive_datetime_treated_as_utc(self):
+        self.assertEqual(to_snow_dt("2024-02-01 12:34:56"), "2024-02-01 12:34:56")
+
+    def test_offset_converted_to_utc(self):
+        self.assertEqual(to_snow_dt("2024-02-01T14:34:56+02:00"), "2024-02-01 12:34:56")
+
+    def test_strict_raises_on_unparseable_config_value(self):
+        with self.assertRaises(InvalidDatetimeError):
+            to_snow_dt("not-a-date", strict=True, context="config start_date")
+
+    def test_non_strict_passes_record_data_through_with_a_warning(self):
+        """One malformed row must not abort the whole stream."""
+        with patch("tap_servicenow.datetime_utils.LOGGER") as mock_log:
+            self.assertEqual(to_snow_dt("not-a-date"), "not-a-date")
+        mock_log.warning.assert_called_once()
+
+    def test_empty_value_passes_through_in_both_modes(self):
+        self.assertEqual(to_snow_dt(""), "")
+        self.assertEqual(to_snow_dt("", strict=True), "")
+
+    def test_subsecond_precision_is_truncated_and_warned(self):
+        """The keyset cursor's ^NQ branch matches the boundary with `=`.
+
+        Truncating silently would make that clause miss rows inside the same
+        second. ServiceNow returns second precision today, so this is a
+        tripwire rather than a live defect.
+        """
+        with patch("tap_servicenow.datetime_utils.LOGGER") as mock_log:
+            result = to_snow_dt("2024-02-01T12:34:56.789Z")
+        self.assertEqual(result, "2024-02-01 12:34:56")
+        mock_log.warning.assert_called_once()
+        self.assertIn("sub-second", mock_log.warning.call_args[0][0])
+
+    def test_whole_second_does_not_warn(self):
+        with patch("tap_servicenow.datetime_utils.LOGGER") as mock_log:
+            to_snow_dt("2024-02-01T12:34:56Z")
+        mock_log.warning.assert_not_called()

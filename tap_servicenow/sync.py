@@ -5,6 +5,7 @@ from tap_servicenow.streams import STREAMS, abstracts
 from tap_servicenow.client import Client
 from tap_servicenow.exceptions import (
     ServiceNowForbiddenError,
+    ServiceNowIncompleteSyncError,
     ServiceNowUnauthorizedError,
 )
 from tap_servicenow.streams.abstracts import IncrementalStream, FullTableStream
@@ -90,6 +91,10 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
     # part-way through a sync. The run still fails at the end (below) so the
     # job is not reported as successful.
     permission_failures = []
+    # Streams that stopped before the end of their data. Same isolation as
+    # permission failures: one stranded stream must not cost us the rest, but
+    # the run cannot report success either.
+    incomplete_streams = []
 
     with singer.Transformer() as transformer:
         for stream_name in streams_to_sync:
@@ -105,11 +110,28 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
             update_currently_syncing(state, stream_name)
             try:
                 total_records = stream.sync(state=state, transformer=transformer)
-            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
-                # The stream raised before writing its bookmark, so nothing was
-                # advanced past rows we never fetched. Record it and move on.
-                # The exception already carries the stream and endpoint, so this
-                # only adds what happens next.
+            except ServiceNowIncompleteSyncError as e:
+                LOGGER.critical("%s Continuing with the remaining streams.", e)
+                incomplete_streams.append(stream_name)
+                update_currently_syncing(state, None)
+                continue
+
+            except ServiceNowUnauthorizedError:
+                # 401 means the credentials themselves are dead, not that this
+                # one table is off limits. Every remaining stream would fail
+                # identically, so grinding through a 1,700-stream catalog to
+                # collect the same error 1,700 times helps nobody. Abort now.
+                LOGGER.critical(
+                    "Authentication failed while syncing stream '%s'. The "
+                    "credentials are invalid or expired - aborting the run "
+                    "rather than retrying every remaining stream.", stream_name
+                )
+                raise
+
+            except ServiceNowForbiddenError as e:
+                # 403 is per-table: this account cannot read THIS table, but
+                # the others may be fine. The stream raised before writing its
+                # bookmark, so nothing advanced past rows we never fetched.
                 LOGGER.critical("%s Continuing with the remaining streams.", e)
                 permission_failures.append(stream_name)
                 update_currently_syncing(state, None)
@@ -121,6 +143,16 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
                     stream_name, total_records
                 )
             )
+
+    if incomplete_streams:
+        raise ServiceNowIncompleteSyncError(
+            "{} of {} selected stream(s) did not replicate fully: {}. Their "
+            "bookmarks were left unchanged so the missing rows are re-read on "
+            "the next run.".format(
+                len(incomplete_streams), len(streams_to_sync),
+                ", ".join(incomplete_streams),
+            )
+        )
 
     if permission_failures:
         raise ServiceNowForbiddenError(
