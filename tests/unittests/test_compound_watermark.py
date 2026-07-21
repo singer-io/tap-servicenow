@@ -4,7 +4,7 @@ Unit tests for:
   - BaseStream.get_records  — keyset pagination (sys_id-based, no sysparm_offset)
 """
 import unittest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import singer
 from tap_servicenow.streams.abstracts import IncrementalStream, BaseStream
@@ -417,10 +417,6 @@ class TestGetRecordsKeyset(unittest.TestCase):
         list(stream.get_records())
         params = client.make_request.call_args_list[0][0][2]
         self.assertIn("ORDERBYsys_id", params["sysparm_query"])
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 # ---------------------------------------------------------------------------
