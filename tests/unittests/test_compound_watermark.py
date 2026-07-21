@@ -819,3 +819,38 @@ class TestUncursorableRecords(unittest.TestCase):
                 {"result": [{"sys_id": "id-2", "sys_updated_on": ""}]},
                 {"result": []},
             ])
+
+
+class TestStalledPageNotReEmitted(unittest.TestCase):
+    """get_records must check a page for repetition before emitting it.
+
+    On a stall the same rows arrive twice. Yielding as they were read put the
+    duplicate page downstream before the stall was detected. The stall now
+    comes from a server that ignores sysparm_offset rather than from a keyset
+    cursor, but the requirement is unchanged.
+    """
+
+    def test_stalled_page_is_not_emitted(self):
+        from tap_servicenow.exceptions import ServiceNowIncompleteSyncError
+        client = MagicMock()
+        client.base_url = "https://test.service-now.com/api/now/table"
+        client.config = {"start_date": "2024-01-01T00:00:00Z"}
+        # No X-Total-Count, so the loop's only stop signal is an empty page.
+        client.get_total_count.return_value = None
+        # Same single row forever: page 1 is emitted, page 2 repeats it and
+        # must be suppressed.
+        client.make_request.return_value = {
+            "result": [_record("id-1", "2024-01-01T00:00:00Z")]
+        }
+        stream = ConcreteBase(client, _make_catalog())
+        stream.url_endpoint = "https://test.service-now.com/api/now/table/base_stream"
+
+        collected = []
+        with self.assertRaises(ServiceNowIncompleteSyncError):
+            for rec in stream.get_records():
+                collected.append(rec["sys_id"])
+
+        self.assertEqual(
+            collected, ["id-1"],
+            "the repeated page must not be emitted a second time",
+        )

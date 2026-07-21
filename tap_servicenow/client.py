@@ -120,6 +120,10 @@ class Client:
     def __init__(self, config: Mapping[str, Any]) -> None:
         self.config = config
         self._session = session()
+        # Set once, not per request: requests.Session is not documented as
+        # thread-safe and the discovery pool runs ten threads against this one
+        # object. The credentials never change during a run.
+        self._session.auth = HTTPBasicAuth(config["user"], config["password"])
         self.base_url = f"https://{config['instance']}.service-now.com/api/now/table"
         config_request_timeout = config.get("request_timeout")
         self.request_timeout = float(config_request_timeout) if config_request_timeout else REQUEST_TIMEOUT
@@ -135,11 +139,7 @@ class Client:
         pass
 
     def authenticate(self, headers: Dict, params: Dict) -> Tuple[Dict, Dict]:
-        """Authenticates the request with basic auth headers."""
-        self._session.auth = HTTPBasicAuth(
-            self.config["user"],
-            self.config["password"]
-        )
+        """Pass-through; auth is bound to the Session in __init__."""
         return headers, params
 
     @RETRY_ON_TRANSIENT

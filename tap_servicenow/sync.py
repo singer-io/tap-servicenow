@@ -144,23 +144,41 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
                 )
             )
 
-    if incomplete_streams:
-        raise ServiceNowIncompleteSyncError(
-            "{} of {} selected stream(s) did not replicate fully: {}. Their "
-            "bookmarks were left unchanged so the missing rows are re-read on "
-            "the next run.".format(
-                len(incomplete_streams), len(streams_to_sync),
-                ", ".join(incomplete_streams),
+    # One aggregate failure describing BOTH categories. Raising on the first
+    # non-empty list would have hidden the other from the caller entirely: a
+    # run with stranded and forbidden streams reported only the stranded ones,
+    # leaving the permission failures in per-stream logs that nothing points
+    # at. The two need different operator responses (re-run vs request access),
+    # so a run that has both has to say so.
+    if incomplete_streams or permission_failures:
+        clauses = []
+        if incomplete_streams:
+            clauses.append(
+                "{} of {} selected stream(s) did not replicate fully: {}".format(
+                    len(incomplete_streams), len(streams_to_sync),
+                    ", ".join(incomplete_streams),
+                )
             )
+        if permission_failures:
+            clauses.append(
+                "the account lacks 'read' access to {} of {} selected "
+                "stream(s): {}".format(
+                    len(permission_failures), len(streams_to_sync),
+                    ", ".join(permission_failures),
+                )
+            )
+
+        message = ". ".join(clauses)
+        message = (
+            message[0].upper() + message[1:] +
+            ". No bookmark was advanced for any affected stream, so their rows "
+            "are re-read on the next run. The remaining stream(s) synced "
+            "successfully."
         )
 
-    if permission_failures:
-        raise ServiceNowForbiddenError(
-            "The account lacks 'read' access to {} of {} selected stream(s): {}. "
-            "Bookmarks for these streams were left unchanged; all other streams "
-            "synced successfully.".format(
-                len(permission_failures),
-                len(streams_to_sync),
-                ", ".join(permission_failures),
-            )
-        )
+        # An incomplete sync outranks a permission failure: it means rows are
+        # missing from a table the account CAN read, which granting access will
+        # not fix. Both are named in the message either way.
+        if incomplete_streams:
+            raise ServiceNowIncompleteSyncError(message)
+        raise ServiceNowForbiddenError(message)
