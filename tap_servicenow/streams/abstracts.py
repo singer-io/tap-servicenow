@@ -192,10 +192,19 @@ class BaseStream(ABC):
                 prev_sys_id = last_sys_id
                 readable_on_page = 0
 
+                # Buffer the page before emitting any of it. On a stall the same
+                # rows come back a second time, and yielding as we go meant the
+                # duplicate page was already downstream before we detected it.
+                page: List = []
                 for record in raw_records:
                     if record:  # skip empty {} records
                         readable_on_page += 1
                         last_sys_id = record.get("sys_id", last_sys_id)
+                        page.append(record)
+
+                stalled = bool(raw_records) and last_sys_id == prev_sys_id
+                if not stalled:
+                    for record in page:
                         yield record
 
                 # Row-level ACLs are applied after the query, so a short page is
@@ -218,7 +227,7 @@ class BaseStream(ABC):
                 # truncated table as a completed one - and for a destination
                 # that truncate-and-replaces, the missing rows get deleted
                 # downstream.
-                if raw_records and last_sys_id == prev_sys_id:
+                if stalled:
                     raise ServiceNowIncompleteSyncError(
                         f"Stream '{self.tap_stream_id}' stopped before the end of "
                         f"its data: the keyset cursor stalled at sys_id "
@@ -345,7 +354,11 @@ class IncrementalStream(BaseStream):
         replication_key = self.replication_keys[0] if self.replication_keys else "sys_updated_on"
 
         # --- Retrieve bookmark --------------------------------------------
-        bookmark_dt: str = to_snow_dt(self.get_bookmark(state, self.tap_stream_id))
+        bookmark_dt: str = to_snow_dt(
+            self.get_bookmark(state, self.tap_stream_id),
+            strict=True,
+            context=f"the bookmark of stream '{self.tap_stream_id}'",
+        )
         current_max_dt: str = bookmark_dt
 
         page_size: int = self.page_size or 1000
@@ -435,7 +448,11 @@ class IncrementalStream(BaseStream):
                             skipped_uncursorable += 1
                             continue
 
-                        record_dt: str = to_snow_dt(raw_dt)
+                        # Not strict: one malformed row must not abort the
+                        # stream, and to_snow_dt warns before passing it through.
+                        record_dt: str = to_snow_dt(
+                            raw_dt, context=f"stream '{self.tap_stream_id}'"
+                        )
 
                         # Advance the keyset cursor to the last record on this page
                         last_page_dt = record_dt

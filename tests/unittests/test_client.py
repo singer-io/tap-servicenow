@@ -5,6 +5,7 @@ import requests
 from unittest.mock import patch
 from parameterized import parameterized
 from requests.exceptions import Timeout, ConnectionError, ChunkedEncodingError
+from tap_servicenow.datetime_utils import InvalidDatetimeError, to_snow_dt
 from tap_servicenow.client import (
     Client,
     MAX_BACKOFF_SECONDS,
@@ -289,3 +290,53 @@ class TestRetryWaitSchedule(unittest.TestCase):
             self.assertLessEqual(wait, bound)
         # B's first wait is bounded by 2, not by A's fourth step (16).
         self.assertLessEqual(first_b, 2)
+
+
+class TestDatetimeNormalization(unittest.TestCase):
+    """to_snow_dt guards the values that go into sysparm_query.
+
+    An unparseable config or bookmark value used to pass through unchanged,
+    producing `sys_updated_on>=<garbage>`. ServiceNow answers that with HTTP
+    200 and either zero rows or the condition ignored - silently wrong.
+    """
+
+    def test_normalizes_to_servicenow_format(self):
+        self.assertEqual(to_snow_dt("2024-02-01T12:34:56Z"), "2024-02-01 12:34:56")
+
+    def test_naive_datetime_treated_as_utc(self):
+        self.assertEqual(to_snow_dt("2024-02-01 12:34:56"), "2024-02-01 12:34:56")
+
+    def test_offset_converted_to_utc(self):
+        self.assertEqual(to_snow_dt("2024-02-01T14:34:56+02:00"), "2024-02-01 12:34:56")
+
+    def test_strict_raises_on_unparseable_config_value(self):
+        with self.assertRaises(InvalidDatetimeError):
+            to_snow_dt("not-a-date", strict=True, context="config start_date")
+
+    def test_non_strict_passes_record_data_through_with_a_warning(self):
+        """One malformed row must not abort the whole stream."""
+        with patch("tap_servicenow.datetime_utils.LOGGER") as mock_log:
+            self.assertEqual(to_snow_dt("not-a-date"), "not-a-date")
+        mock_log.warning.assert_called_once()
+
+    def test_empty_value_passes_through_in_both_modes(self):
+        self.assertEqual(to_snow_dt(""), "")
+        self.assertEqual(to_snow_dt("", strict=True), "")
+
+    def test_subsecond_precision_is_truncated_and_warned(self):
+        """The keyset cursor's ^NQ branch matches the boundary with `=`.
+
+        Truncating silently would make that clause miss rows inside the same
+        second. ServiceNow returns second precision today, so this is a
+        tripwire rather than a live defect.
+        """
+        with patch("tap_servicenow.datetime_utils.LOGGER") as mock_log:
+            result = to_snow_dt("2024-02-01T12:34:56.789Z")
+        self.assertEqual(result, "2024-02-01 12:34:56")
+        mock_log.warning.assert_called_once()
+        self.assertIn("sub-second", mock_log.warning.call_args[0][0])
+
+    def test_whole_second_does_not_warn(self):
+        with patch("tap_servicenow.datetime_utils.LOGGER") as mock_log:
+            to_snow_dt("2024-02-01T12:34:56Z")
+        mock_log.warning.assert_not_called()

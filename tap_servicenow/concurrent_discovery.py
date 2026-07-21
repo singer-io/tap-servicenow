@@ -48,7 +48,9 @@ def _build_access_probe_params(has_replication_key: bool, start_date: Optional[s
     if not has_replication_key:
         return params
 
-    bookmark_dt = to_snow_dt(start_date or "")
+    bookmark_dt = to_snow_dt(
+        start_date or "", strict=True, context="config start_date"
+    )
     if bookmark_dt:
         params["sysparm_query"] = (
             f"sys_updated_on>={bookmark_dt}"
@@ -98,6 +100,18 @@ class ConcurrentDiscovery(ABC):
                         "ConcurrentDiscovery: error processing item %r: %s", item, exc
                     )
                     if self.FAIL_FAST:
+                        # Cancel what has not started yet before leaving the
+                        # `with` block. Without this, ThreadPoolExecutor.__exit__
+                        # calls shutdown(wait=True) and the "abort" still works
+                        # through every queued chunk first - with hundreds of
+                        # chunks at max_workers=10 that is a long wait to report
+                        # a failure we already know about.
+                        cancelled = sum(1 for f in futures if f.cancel())
+                        if cancelled:
+                            LOGGER.error(
+                                "Aborting discovery phase: cancelled %d queued "
+                                "item(s).", cancelled
+                            )
                         raise
         return results
 
