@@ -51,7 +51,24 @@ def _make_client(config=None, readable_rows=None):
         endpoint = endpoint or kwargs.get("endpoint") or ""
         if "sys_dictionary" in endpoint:
             rv = c.make_request.return_value
-            return rv if isinstance(rv, dict) else {"result": []}
+            if not isinstance(rv, dict):
+                return {"result": []}
+            # Honor the keyset cursor instead of replaying the same page. The
+            # fetcher walks sys_dictionary by sys_id and stops on an empty page,
+            # so a fixture that ignores `sys_id>` never terminates - and one
+            # whose rows carry no sys_id at all looks like a stalled cursor,
+            # which is now a hard error. Real dictionary rows always carry
+            # sys_id: 0 of 128,210 lacked one when measured against a live
+            # instance.
+            rows = sorted(rv.get("result", []), key=lambda r: r.get("sys_id", ""))
+            query = (params or {}).get("sysparm_query", "") or ""
+            for clause in query.split("^"):
+                if clause.startswith("sys_id>"):
+                    cursor = clause[len("sys_id>"):]
+                    rows = [r for r in rows if r.get("sys_id", "") > cursor]
+                    break
+            limit = (params or {}).get("sysparm_limit")
+            return {"result": rows[:limit] if limit else rows}
         table = endpoint.rsplit("/", 1)[-1]
         return {"result": rows_by_table.get(table, [])}
 
@@ -60,10 +77,16 @@ def _make_client(config=None, readable_rows=None):
 
 
 def _dict_fields(table, *elements):
-    """Build a list of sys_dictionary field records for *table*."""
+    """Build a list of sys_dictionary field records for *table*.
+
+    Every row carries a sys_id, because the fetcher paginates on it and a page
+    with no usable cursor is a stall, which is an error. Real rows always have
+    one; a fixture without it is testing a state the API does not produce.
+    """
     return [
-        {"name": table, "element": elem, "internal_type": "string"}
-        for elem in elements
+        {"name": table, "element": elem, "internal_type": "string",
+         "sys_id": f"{table}-{i:04d}"}
+        for i, elem in enumerate(elements)
     ]
 
 
@@ -182,8 +205,11 @@ class TestBatchSysDictionary(unittest.TestCase):
             c for c in client.make_request.call_args_list
             if "sys_dictionary" in c[1].get("endpoint", "")
         ]
-        # 10 tables, chunk=50 → 1 batch call
-        self.assertEqual(len(dict_calls), 1)
+        # 10 tables, chunk=50 -> 1 chunk. Each chunk costs one data page plus
+        # the terminal empty page that ends its keyset walk, so 2 calls - still
+        # far fewer than the 10 the unbatched version would make.
+        self.assertEqual(len(dict_calls), 2)
+        self.assertLess(len(dict_calls), len(tables))
 
     def test_chunk_boundary_creates_correct_number_of_requests(self):
         """
@@ -194,11 +220,10 @@ class TestBatchSysDictionary(unittest.TestCase):
         all_fields = []
         for t in tables:
             all_fields += _dict_fields(t, "sys_id", "sys_updated_on")
-        # Both batch calls return the same pool (union is idempotent for our test)
-        client.make_request.side_effect = [
-            {"result": all_fields},  # batch 1
-            {"result": all_fields},  # batch 2
-        ]
+        # Both chunks draw from the same pool (union is idempotent for our test).
+        # return_value rather than side_effect because each chunk now keyset-walks
+        # until it gets an empty page, so the call count per chunk is not fixed.
+        client.make_request.return_value = {"result": all_fields}
 
         p1, p2 = _patch_tables(tables)
         with p1, p2:
@@ -208,7 +233,9 @@ class TestBatchSysDictionary(unittest.TestCase):
             c for c in client.make_request.call_args_list
             if "sys_dictionary" in c[1].get("endpoint", "")
         ]
-        self.assertEqual(len(dict_calls), 2)
+        # 52 tables, chunk=50 -> 2 chunks, each costing a data page plus the
+        # terminal empty page that ends its keyset walk.
+        self.assertEqual(len(dict_calls), 4)
 
     def test_no_count_and_no_ref_link_in_dict_requests(self):
         table_map = {"incident": ""}
@@ -275,15 +302,23 @@ class TestInheritanceResolution(unittest.TestCase):
 
         table_map = {"task": "", "incident": "task"}
         # Both define 'description'; task as plain string, incident as html
+        # NB: `element: "sys_id"` names a FIELD on the target table; the row's
+        # own `sys_id` is the pagination cursor and is separate.
         task_fields = [
-            {"name": "task",     "element": "sys_id",      "internal_type": "string"},
-            {"name": "task",     "element": "description",  "internal_type": "string"},
-            {"name": "task",     "element": "sys_updated_on", "internal_type": "glide_date_time"},
+            {"name": "task",     "element": "sys_id",      "internal_type": "string",
+             "sys_id": "task-0000"},
+            {"name": "task",     "element": "description",  "internal_type": "string",
+             "sys_id": "task-0001"},
+            {"name": "task",     "element": "sys_updated_on", "internal_type": "glide_date_time",
+             "sys_id": "task-0002"},
         ]
         incident_fields = [
-            {"name": "incident", "element": "sys_id",      "internal_type": "string"},
-            {"name": "incident", "element": "description",  "internal_type": "html"},
-            {"name": "incident", "element": "sys_updated_on", "internal_type": "glide_date_time"},
+            {"name": "incident", "element": "sys_id",      "internal_type": "string",
+             "sys_id": "incident-0000"},
+            {"name": "incident", "element": "description",  "internal_type": "html",
+             "sys_id": "incident-0001"},
+            {"name": "incident", "element": "sys_updated_on", "internal_type": "glide_date_time",
+             "sys_id": "incident-0002"},
         ]
         all_fields = task_fields + incident_fields
         client = _make_client()
@@ -578,13 +613,19 @@ class TestDictionaryFetcherPagination(unittest.TestCase):
         self.assertEqual(fetcher.process_item(["t1"]), {})
         self.assertEqual(client.make_request.call_count, 1)
 
-    def test_stall_guard_stops_when_cursor_cannot_advance(self):
-        """A page carrying no advanceable sys_id must not loop forever."""
+    def test_stall_guard_raises_when_cursor_cannot_advance(self):
+        """A page carrying no advanceable sys_id must raise, not loop and not break.
+
+        It must not loop forever, and it must not quietly return the partial
+        field map either: page length says nothing about whether the chunk is
+        exhausted, because sys_dictionary is row-ACL-filtered like any other
+        table. See test_dictionary_short_stalled_page_raises for the measurement.
+        """
         stalled = [{"name": "t1", "element": "f1", "internal_type": "string", "sys_id": ""}]
         client = self._client([stalled, stalled, stalled])
         fetcher = ServiceNowDictionaryFetcher(client, dict_page_size=50)
-        result = fetcher.process_item(["t1"])
-        self.assertEqual(set(result["t1"].keys()), {"f1"})
+        with self.assertRaises(ServiceNowIncompleteSyncError):
+            fetcher.process_item(["t1"])
         self.assertEqual(client.make_request.call_count, 1)
 
     def test_request_failure_raises_instead_of_returning_partial(self):
@@ -901,13 +942,50 @@ class TestUnverifiedGuards(unittest.TestCase):
             fetcher.process_item(["incident"])
         self.assertIn("incomplete", str(ctx.exception).lower())
 
-    def test_dictionary_short_stalled_page_is_end_of_chunk(self):
-        """A SHORT page with no cursor is the end, not an error."""
+    def test_dictionary_short_stalled_page_raises(self):
+        """A SHORT stalled page is NOT end-of-chunk. It raises like a full one.
+
+        This previously returned the partial field map, on the theory that
+        sys_dictionary is not row-ACL-filtered the way data rows are, so a short
+        page could be trusted as the end. Measured against a dev instance, that
+        is false: 151,477 rows by X-Total-Count against 128,210 readable (15.4%
+        ACL-hidden), and 151 of 152 pages came back short of the requested 1,000
+        with data still behind them. Same shape as an ordinary table.
+
+        So page length carries no end-of-data information, and breaking here
+        returned a TRUNCATED field map - those columns then go missing from the
+        catalog and the destination with no error anywhere, and without an
+        exception FAIL_FAST could not catch it either.
+        """
         client = MagicMock()
         client.base_url = "https://t/api/now/table"
         rows = [{"name": "incident", "element": "f0", "internal_type": "string"}]
         client.make_request.return_value = {"result": rows}
 
+        # 1 row against a limit of 100: as short as a page gets, and stalled.
         fetcher = ServiceNowDictionaryFetcher(client, dict_page_size=100, max_workers=1)
-        result = fetcher.process_item(["incident"])   # must not raise
-        self.assertIn("incident", result)
+        with self.assertRaises(ServiceNowIncompleteSyncError) as ctx:
+            fetcher.process_item(["incident"])
+        self.assertIn("incomplete", str(ctx.exception).lower())
+        self.assertEqual(client.make_request.call_count, 1)
+
+    def test_dictionary_short_page_that_advances_keeps_paginating(self):
+        """The common case: short pages are normal and must NOT stop the walk.
+
+        On a real instance 151 of 152 sys_dictionary pages come back short. Only
+        a short page that also fails to advance the cursor is an error; a short
+        page carrying usable sys_ids is just ACL filtering doing its thing.
+        """
+        client = MagicMock()
+        client.base_url = "https://t/api/now/table"
+        client.make_request.side_effect = [
+            {"result": [{"name": "incident", "element": "f0",
+                         "internal_type": "string", "sys_id": "s1"}]},
+            {"result": [{"name": "incident", "element": "f1",
+                         "internal_type": "string", "sys_id": "s2"}]},
+            {"result": []},
+        ]
+        fetcher = ServiceNowDictionaryFetcher(client, dict_page_size=100, max_workers=1)
+        result = fetcher.process_item(["incident"])
+        self.assertEqual(set(result["incident"].keys()), {"f0", "f1"})
+        self.assertEqual(client.make_request.call_count, 3)

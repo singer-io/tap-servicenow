@@ -214,22 +214,34 @@ class ServiceNowDictionaryFetcher(ConcurrentDiscovery):
             # failure the raise above exists to prevent, reached without an
             # exception, so FAIL_FAST cannot catch it either.
             #
-            # Only escalate when the page came back FULL, which is the case
-            # where more rows certainly remain and we have no way to reach them.
-            # A short page carrying no usable cursor is the end of the chunk
-            # (sys_dictionary rows are not ACL-filtered the way data rows are,
-            # and every row carries sys_id because we request it explicitly).
+            # This raises whatever the page size was. An earlier version only
+            # escalated on a FULL page and treated a short stalled page as the
+            # end of the chunk, on the theory that sys_dictionary is not
+            # row-ACL-filtered the way data rows are. It is. Measured on a dev
+            # instance: 151,477 rows by X-Total-Count against 128,210 readable,
+            # so 15.4% are ACL-hidden, and 151 of 152 pages came back short of
+            # the requested 1,000 with data still behind them (813, 855, 856,
+            # 831, ...). That is the same shape as an ordinary table like `task`,
+            # not like an unfiltered one like `cmdb_ci`. So page length says
+            # nothing about whether the chunk is exhausted, and a short stalled
+            # page cannot be read as end-of-data.
+            #
+            # Normal termination never reaches here: a chunk that is genuinely
+            # finished returns an empty page and breaks above. Reaching a stall
+            # means the page had rows but none carried a usable sys_id, which is
+            # an anomaly worth failing on rather than silently truncating.
             if last_sys_id == prev_sys_id:
-                if len(rows) >= self.dict_page_size:
-                    raise ServiceNowIncompleteSyncError(
-                        f"sys_dictionary paging stalled at sys_id "
-                        f"'{last_sys_id}' after {pages_fetched} full page(s) "
-                        f"for chunk starting {chunk[:3]!r}. More rows remain "
-                        f"but the cursor cannot advance, so the field map for "
-                        f"these tables would be incomplete. Failing discovery "
-                        f"rather than emitting a truncated schema."
-                    )
-                break
+                raise ServiceNowIncompleteSyncError(
+                    f"sys_dictionary paging stalled at sys_id "
+                    f"'{last_sys_id}' after {pages_fetched} page(s) for chunk "
+                    f"starting {chunk[:3]!r}: the page returned "
+                    f"{len(rows)} row(s) but none advanced the cursor. Page "
+                    f"length does not indicate end-of-data here, because "
+                    f"sys_dictionary is row-ACL-filtered like any other table "
+                    f"(KB0727636), so the field map for these tables would be "
+                    f"incomplete. Failing discovery rather than emitting a "
+                    f"truncated schema."
+                )
         return partial
 
     def fetch(
