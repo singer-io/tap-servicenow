@@ -1,6 +1,8 @@
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-import backoff, time
+import random
+
+import backoff
 import requests
 from requests import session
 from requests.exceptions import Timeout, ConnectionError, ChunkedEncodingError
@@ -36,13 +38,74 @@ def raise_for_error(response: requests.Response) -> None:
         )
         raise exc(message, response) from None
 
-def wait_if_retry_after(details):
-    """Backoff handler that checks for a 'retry_after' attribute in the exception
-    and sleeps for the specified duration to respect API rate limits.
+MAX_BACKOFF_SECONDS = 300
+
+
+def retry_after_or_expo(base: float = 2, factor: float = 2,
+                        max_value: float = MAX_BACKOFF_SECONDS):
+    """wait_gen honoring ServiceNow's Retry-After, falling back to exponential.
+
+    Yields Retry-After unchanged when the response carried one (429s, and 5xx
+    responses that include the header). Otherwise yields the same exponential
+    schedule as before - 2, 4, 8, 16 seconds - with full jitter applied, for
+    connection resets, timeouts, and 5xx without a header.
+
+    Two things this has to get right, both of which the previous
+    on_backoff-based version got wrong:
+
+    1. Sleeping inside on_backoff does not replace backoff's own sleep.
+       `retry_exception` passes the generated wait to the handler by keyword
+       and then sleeps its own local copy, so the two stacked: a 429 with
+       `Retry-After: 60` waited 62, 64, 68, then 76 seconds. Mutating
+       details['wait'] from the handler does not help either, for the same
+       reason - the sleep never reads it back. Yielding the value here makes
+       it the wait, exactly once.
+
+    2. Jitter must not apply to Retry-After. backoff's default `full_jitter`
+       rewrites any wait to uniform(0, wait), which turns a 60-second
+       Retry-After into anything from 0 to 60 and lets the tap retry well
+       before the server said it may. The decorator therefore passes
+       jitter=None, and this generator jitters only the exponential branch,
+       where spreading retries across the discovery thread pool is what we
+       actually want.
+
+    backoff builds a fresh generator per decorated call, so `attempt` is
+    per-request and safe under that thread pool.
     """
-    exc = details['exception']
-    if hasattr(exc, 'retry_after') and exc.retry_after is not None:
-        time.sleep(exc.retry_after)  # Force exact wait
+    exc = yield
+    attempt = 0
+    while True:
+        retry_after = getattr(exc, "retry_after", None)
+        if retry_after is not None:
+            # Honor the server's instruction exactly; no jitter, no expo.
+            wait = min(float(retry_after), max_value)
+        else:
+            wait = random.uniform(0, min(factor * base ** attempt, max_value))
+            attempt += 1
+        exc = yield wait
+
+
+# Shared retry policy for ALL outbound requests. Retries transient failures
+# (connection resets, timeouts) and ServiceNowBackoffError (429 / 5xx, which
+# carries Retry-After). 401/403/404 are intentionally absent, so they raise
+# immediately for the caller to handle. Both make_request() and the get() access
+# probe use this - previously get() had no retry, so a single 429 during
+# discovery silently dropped a table the account could actually read.
+# jitter=None because retry_after_or_expo applies jitter itself, only on the
+# branch where it is appropriate (see its docstring).
+RETRY_ON_TRANSIENT = backoff.on_exception(
+    wait_gen=retry_after_or_expo,
+    jitter=None,
+    exception=(
+        ConnectionResetError,
+        ConnectionError,
+        ChunkedEncodingError,
+        Timeout,
+        ServiceNowBackoffError,  # covers ServiceNowRateLimitError via inheritance
+    ),
+    max_tries=5,
+)
+
 
 class Client:
     """
@@ -57,6 +120,10 @@ class Client:
     def __init__(self, config: Mapping[str, Any]) -> None:
         self.config = config
         self._session = session()
+        # Set once, not per request: requests.Session is not documented as
+        # thread-safe and the discovery pool runs ten threads against this one
+        # object. The credentials never change during a run.
+        self._session.auth = HTTPBasicAuth(config["user"], config["password"])
         self.base_url = f"https://{config['instance']}.service-now.com/api/now/table"
         config_request_timeout = config.get("request_timeout")
         self.request_timeout = float(config_request_timeout) if config_request_timeout else REQUEST_TIMEOUT
@@ -72,25 +139,55 @@ class Client:
         pass
 
     def authenticate(self, headers: Dict, params: Dict) -> Tuple[Dict, Dict]:
-        """Authenticates the request with basic auth headers."""
-        self._session.auth = HTTPBasicAuth(
-            self.config["user"],
-            self.config["password"]
-        )
+        """Pass-through; auth is bound to the Session in __init__."""
         return headers, params
-    
+
+    @RETRY_ON_TRANSIENT
+    def get_total_count(
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """Return the total record count from the X-Total-Count response header.
+
+        Makes a lightweight probe request (sysparm_limit=1, no sysparm_no_count)
+        so ServiceNow includes X-Total-Count in the response.  This value
+        reflects the table size BEFORE row-level ACL filtering, letting
+        get_records() paginate through ACL-hidden rows instead of stopping on
+        the first empty page.
+
+        Returns None when the header is absent (e.g. on virtual tables).
+        """
+        probe_params = dict(params or {})
+        probe_params.pop("sysparm_no_count", None)  # must be absent for the header
+        probe_params["sysparm_limit"] = 1
+        probe_params["sysparm_offset"] = 0
+        probe_headers = dict(headers or {})
+        probe_headers, probe_params = self.authenticate(probe_headers, probe_params)
+        response = self._session.get(
+            endpoint, headers=probe_headers, params=probe_params,
+            timeout=self.request_timeout,
+        )
+        raise_for_error(response)
+        count_str = (response.headers.get("X-Total-Count") or "").strip()
+        return int(count_str) if count_str.isdigit() else None
+
+    @RETRY_ON_TRANSIENT
     def get(
         self,
         table: str,
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Lightweight access probe: raises ServiceNowError subclass on 4xx/5xx.
+        """Per-table read-access probe: raises a ServiceNowError subclass on 4xx/5xx.
 
         Routes through raise_for_error so callers receive typed exceptions
-        (e.g. ServiceNowForbiddenError) rather than raw status codes.
-        Callers that need to detect permission issues should catch
-        ServiceNowForbiddenError / ServiceNowUnauthorizedError.
+        (e.g. ServiceNowForbiddenError) rather than raw status codes. The shared
+        RETRY_ON_TRANSIENT policy retries 429/5xx (honoring Retry-After) so a
+        transient rate-limit during the discovery probe does NOT wrongly drop a
+        table the account can actually read; 401/403/404 raise immediately for
+        the caller to classify.
         """
         params = params or {}
         headers = headers or {}
@@ -124,19 +221,7 @@ class Client:
             timeout=self.request_timeout
         )
 
-    @backoff.on_exception(
-        wait_gen=backoff.expo,
-        factor=2,
-        on_backoff=wait_if_retry_after,
-        exception=(
-            ConnectionResetError,
-            ConnectionError,
-            ChunkedEncodingError,
-            Timeout,
-            ServiceNowBackoffError,  # covers ServiceNowRateLimitError via inheritance
-        ),
-        max_tries=5,
-    )
+    @RETRY_ON_TRANSIENT
     def __make_request(
         self, method: str, endpoint: str, **kwargs
     ) -> Optional[Mapping[Any, Any]]:

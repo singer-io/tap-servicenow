@@ -5,7 +5,7 @@ Unit tests for:
   - tap_servicenow.streams.get_sync_tables (filtering logic)
 """
 import unittest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 
 from tap_servicenow.streams import (
     DEFAULT_EXCLUDED_TABLES,
@@ -22,10 +22,14 @@ def _make_client(pages):
     """
     Build a mock Client whose make_request returns successive pages.
     Each item in *pages* is the list of records for that page.
+
+    A terminal empty page is always appended: keyset pagination past the end of
+    sys_db_object returns an empty result set, and that empty page (not a short
+    page) is the correct stop signal.
     """
     client = MagicMock()
     client.base_url = "https://test.service-now.com/api/now/table"
-    client.make_request.side_effect = [{"result": p} for p in pages]
+    client.make_request.side_effect = [{"result": p} for p in pages] + [{"result": []}]
     return client
 
 
@@ -71,7 +75,7 @@ class TestDefaultExcludedTables(unittest.TestCase):
 class TestGetAllTablesKeyset(unittest.TestCase):
 
     def test_single_page_returns_all_tables(self):
-        """When page has fewer rows than limit, only one request is made."""
+        """A short data page is followed by one empty page that stops the loop."""
         page = [
             _row("incident", "aaa-1"),
             _row("problem", "aaa-2"),
@@ -80,7 +84,8 @@ class TestGetAllTablesKeyset(unittest.TestCase):
         result = get_all_tables(client, page_size=500)
 
         self.assertEqual(result, {"incident": "", "problem": ""})
-        self.assertEqual(client.make_request.call_count, 1)
+        # One data page + the terminal empty page = two requests.
+        self.assertEqual(client.make_request.call_count, 2)
 
     def test_multi_page_uses_sys_id_cursor(self):
         """
@@ -158,14 +163,41 @@ class TestGetAllTablesKeyset(unittest.TestCase):
         result = get_all_tables(client, page_size=500)
         self.assertEqual(result, {})
 
-    def test_stops_when_page_smaller_than_limit(self):
-        """Only two make_request calls for two pages, third call must not happen."""
+    def test_short_page_does_not_stop_pagination(self):
+        """
+        Regression: ServiceNow returns short pages when row-level ACLs filter
+        rows post-query. A short page must NOT end pagination - every page here
+        is shorter than page_size, yet all tables across all pages are returned.
+        """
+        page1 = [_row(f"a{i}", f"id-a{i}") for i in range(4)]   # 4 < page_size 5
+        page2 = [_row(f"b{i}", f"id-b{i}") for i in range(3)]   # 3 < page_size 5
+        client = _make_client([page1, page2])                  # + terminal empty page
+
+        result = get_all_tables(client, page_size=5)
+
+        self.assertEqual(len(result), 7)
+        self.assertIn("a0", result)
+        self.assertIn("b2", result)
+
+    def test_stops_on_empty_page(self):
+        """Pagination stops on the first genuinely empty page, not before."""
         page1 = [_row(f"t{i}", f"id-{i}") for i in range(5)]
-        page2 = [_row("last", "id-99")]   # < page_size=5 → stop
-        client = _make_client([page1, page2])
+        client = _make_client([page1])   # _make_client appends the empty page
 
         get_all_tables(client, page_size=5)
+
+        # One data page + one empty page.
         self.assertEqual(client.make_request.call_count, 2)
+
+    def test_stalled_cursor_does_not_loop_forever(self):
+        """
+        If a page returns rows but none carry a usable sys_id cursor, the loop
+        must terminate rather than re-issuing the same query forever.
+        """
+        page = [{"name": "orphan"}]      # no sys_id -> cursor cannot advance
+        client = _make_client([page])
+        result = get_all_tables(client, page_size=5)
+        self.assertEqual(result, {"orphan": ""})
 
 
 # ---------------------------------------------------------------------------

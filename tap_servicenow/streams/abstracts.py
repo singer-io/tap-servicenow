@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 import json
-from typing import Any, Dict, Tuple, List, Iterator
+from typing import Any, Dict, NoReturn, Optional, Tuple, List, Iterator
 import singer
 from singer import (
     Transformer,
@@ -13,29 +13,28 @@ from singer import (
     metadata
 )
 
-import time
-from datetime import timezone
-import dateutil.parser
-from tap_servicenow.exceptions import ServiceNowError, ServiceNowForbiddenError
+from tap_servicenow.datetime_utils import to_snow_dt
+from tap_servicenow.exceptions import (
+    ServiceNowError,
+    ServiceNowForbiddenError,
+    ServiceNowIncompleteSyncError,
+    ServiceNowUnauthorizedError,
+)
 
-
-def _to_snow_dt(value: str) -> str:
-    """
-    Normalise any datetime string to ServiceNow's native format
-    """
-    if not value:
-        return value
-    try:
-        dt = dateutil.parser.parse(value)
-        # Treat naive datetimes as UTC
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(timezone.utc)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return value
 
 LOGGER = get_logger()
+
+
+def _raise_permission_error(exc: Exception, stream_name: str, endpoint: str) -> NoReturn:
+    """Raise a typed permission error with stream/endpoint context."""
+    message = (
+        f"Permission error while syncing stream '{stream_name}' on "
+        f"endpoint '{endpoint}': {exc}"
+    )
+    response = getattr(exc, "response", None)
+    if isinstance(exc, ServiceNowUnauthorizedError):
+        raise ServiceNowUnauthorizedError(message, response) from exc
+    raise ServiceNowForbiddenError(message, response) from exc
 
 
 class BaseStream(ABC):
@@ -126,12 +125,21 @@ class BaseStream(ABC):
 
     def get_records(self) -> Iterator:
         """
-        Fetch records using **keyset pagination** (sys_id-based) instead of
-        offset-based pagination.  Offset pagination degrades linearly because
-        the database must re-scan and discard all preceding rows; keyset
-        pagination stays O(1) per page regardless of position.
+        Fetch records using offset-based pagination driven by X-Total-Count.
 
-        Every request includes the three ServiceNow performance params:
+        A lightweight probe request (sysparm_limit=1, no sysparm_no_count) is
+        made first to obtain the X-Total-Count response header, which reflects
+        the full table size BEFORE row-level ACL filtering.  Pagination then
+        continues until ``offset >= total_count`` rather than stopping on the
+        first empty page.  This correctly handles tables where ServiceNow ACLs
+        hide rows mid-table: an empty page in the middle does NOT mean
+        end-of-data (ServiceNow KB0727636), and records at higher offsets may
+        still be accessible.
+
+        When X-Total-Count is unavailable (virtual tables), falls back to
+        stopping on the first completely empty page.
+
+        Every data request includes the three ServiceNow performance params:
         - sysparm_no_count=true    – skips the expensive COUNT query
         - sysparm_exclude_reference_link=true – trims payload size
         - sysparm_fields           – fetches only schema-selected columns
@@ -141,61 +149,106 @@ class BaseStream(ABC):
         pagination into a single cursor.
         """
         page_size = self.page_size or 1000
-        last_sys_id: str = ""
-        has_more: bool = True
 
-        # Build field selection from the schema defined on this stream
-        fields: str = ",".join(self.schema.get("properties", {}).keys()) or ""
+        # url_endpoint is set by FullTableStream.sync before it iterates, but
+        # get_records is also callable directly.
+        endpoint: str = self.url_endpoint or self.get_url_endpoint()
+        fields: str = self.selected_fields()
 
-        while has_more:
+        # ── Step 1: probe for total record count ─────────────────────────────
+        try:
+            total_count = self.client.get_total_count(
+                endpoint, self.params.copy(), self.headers
+            )
+        except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
+            _raise_permission_error(e, self.tap_stream_id, endpoint)
+
+
+        # ── Step 2: offset-paginate through the full range ───────────────────
+        offset = 0
+
+        # Guard against a server that ignores sysparm_offset and keeps serving
+        # the same page. That is what a query_range ACL denial looks like: HTTP
+        # 200 with the pagination clause silently dropped. Track the sys_ids on
+        # the previous page; a page that repeats it means the cursor is not
+        # advancing.
+        #
+        # This has to run on BOTH paths, not just the no-total_count one:
+        #
+        #  - Without a count, the only stop condition is an empty page, so a
+        #    repeated page loops forever.
+        #  - WITH a count the loop does terminate, at ceil(total/page_size)
+        #    iterations, but it emits the same page every time and exits 0. Since
+        #    targets upsert on sys_id, the destination keeps one page of a table
+        #    that may be far larger, and the run reports success. That is the
+        #    same silent truncation this module exists to prevent, and it is the
+        #    COMMON path - ServiceNow returns X-Total-Count on ordinary tables,
+        #    so total_count is normally set and the guard was normally off.
+        #
+        # No false positives either way: under healthy offset pagination
+        # consecutive pages address disjoint row ranges, so their sys_id sets
+        # cannot be equal, and an all-hidden page yields an empty signature that
+        # `and signature` already excludes.
+        seen_page_signature: Optional[frozenset] = None
+
+        while True:
+            if total_count is not None and offset >= total_count:
+                break
+
             try:
                 paginated_params = self.params.copy()
-
-                # Keyset clause appended to whatever base query was set externally
-                base_query = paginated_params.get("sysparm_query", "")
-                if last_sys_id:
-                    keyset = f"sys_id>{last_sys_id}"
-                    paginated_params["sysparm_query"] = (
-                        f"{base_query}^{keyset}^ORDERBYsys_id"
-                        if base_query
-                        else f"{keyset}^ORDERBYsys_id"
-                    )
-                else:
-                    paginated_params["sysparm_query"] = (
-                        f"{base_query}^ORDERBYsys_id" if base_query else "ORDERBYsys_id"
-                    )
-
-                # Remove offset key if it was added by legacy code
-                paginated_params.pop("sysparm_offset", None)
-
-                # Performance params
+                paginated_params["sysparm_offset"] = offset
                 paginated_params["sysparm_limit"] = page_size
                 paginated_params["sysparm_no_count"] = "true"
                 paginated_params["sysparm_exclude_reference_link"] = "true"
                 if fields:
                     paginated_params["sysparm_fields"] = fields
 
-                response = self.client.make_request(
-                    self.http_method,
-                    self.url_endpoint,
-                    paginated_params,
-                    self.headers,
-                    body=json.dumps(self.data_payload),
-                    path=self.path,
-                )
+                try:
+                    response = self.client.make_request(
+                        self.http_method,
+                        endpoint,
+                        paginated_params,
+                        self.headers,
+                        body=json.dumps(self.data_payload),
+                        path=self.path,
+                    )
+                except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
+                    LOGGER.critical(
+                        "Permission error on %s: %s. Aborting this stream.",
+                        endpoint, e,
+                    )
+                    _raise_permission_error(e, self.tap_stream_id, endpoint)
+
                 raw_records = response.get(self.data_key, [])
+
+                # Detect a non-advancing cursor BEFORE emitting, so a repeated
+                # page is never sent downstream twice.
+                signature = frozenset(
+                    r.get("sys_id", "") for r in raw_records if r
+                )
+                if signature and signature == seen_page_signature:
+                    raise ServiceNowIncompleteSyncError(
+                        f"Stream '{self.tap_stream_id}' stopped before the end of "
+                        f"its data: the server returned the same page of "
+                        f"{len(raw_records)} row(s) at offset {offset}, so "
+                        f"sysparm_offset is not advancing. The table is NOT "
+                        f"fully replicated."
+                    )
+                seen_page_signature = signature
 
                 for record in raw_records:
                     if record:  # skip empty {} records
-                        last_sys_id = record.get("sys_id", last_sys_id)
                         yield record
 
-                has_more = len(raw_records) == page_size
+                # Fallback when total_count is unknown: stop on first empty page.
+                if total_count is None and not raw_records:
+                    break
 
-            except ServiceNowForbiddenError as e:
-                LOGGER.critical("403 Forbidden on %s: %s", self.url_endpoint, e)
-                has_more = False
+                offset += page_size
 
+            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError):
+                raise
             except Exception as e:
                 LOGGER.error("Unexpected error while fetching records: %s", e)
                 raise
@@ -236,6 +289,33 @@ class BaseStream(ABC):
         Get the URL endpoint for the stream
         """
         return self.url_endpoint or f"{self.client.base_url}/{self.path}"
+
+    def selected_fields(self) -> str:
+        """Comma-separated `sysparm_fields` value honoring catalog field selection.
+
+        A deselected field is not requested from ServiceNow at all, instead of
+        being fetched over the wire and dropped only at output. This mirrors how
+        the database taps build their column list (desired_columns /
+        should_sync_column) and is the one per-record payload lever the API
+        offers. Key and replication-key fields are always retained so keyset
+        pagination and bookmarking keep working; `automatic` and unspecified
+        fields default to selected (matching should_sync_field default=True).
+        """
+        props = list(self.schema.get("properties", {}).keys())
+        selected = []
+        for field in props:
+            breadcrumb = ("properties", field)
+            inclusion = metadata.get(self.metadata, breadcrumb, "inclusion")
+            is_selected = metadata.get(self.metadata, breadcrumb, "selected")
+            if inclusion == "unsupported":
+                continue
+            if inclusion == "automatic" or is_selected is not False:
+                selected.append(field)
+        # Always keep the keyset cursor and replication key regardless of selection.
+        for required in list(self.key_properties or []) + list(self.replication_keys or []):
+            if required and required in props and required not in selected:
+                selected.append(required)
+        return ",".join(selected)
 
 
 class IncrementalStream(BaseStream):
@@ -279,7 +359,11 @@ class IncrementalStream(BaseStream):
         replication_key = self.replication_keys[0] if self.replication_keys else "sys_updated_on"
 
         # --- Retrieve bookmark --------------------------------------------
-        bookmark_dt: str = _to_snow_dt(self.get_bookmark(state, self.tap_stream_id))
+        bookmark_dt: str = to_snow_dt(
+            self.get_bookmark(state, self.tap_stream_id),
+            strict=True,
+            context=f"the bookmark of stream '{self.tap_stream_id}'",
+        )
         current_max_dt: str = bookmark_dt
 
         page_size: int = self.page_size or 1000
@@ -288,15 +372,17 @@ class IncrementalStream(BaseStream):
             self.update_data_payload(**parent_obj)
 
         # Field selection derived from the stream's schema
-        fields: str = ",".join(self.schema.get("properties", {}).keys()) or ""
+        fields: str = self.selected_fields()
 
         with metrics.record_counter(self.tap_stream_id) as counter:
             empty_record_count = 0
+            skipped_uncursorable = 0
             # Keyset cursor: track the last (sys_updated_on, sys_id) seen so we
             # can advance the query on every page without using offset pagination.
             last_page_dt: str = ""
             last_page_sid: str = ""
             has_more: bool = True
+            cursor_stalled: bool = False
             try:
                 while has_more:
                     if last_page_dt and last_page_sid:
@@ -332,21 +418,46 @@ class IncrementalStream(BaseStream):
                             body=json.dumps(self.data_payload),
                             path=self.path,
                         )
-                    except ServiceNowForbiddenError as e:
-                        LOGGER.critical("403 Forbidden on %s: %s", self.url_endpoint, e)
-                        break
+                    except (ServiceNowForbiddenError, ServiceNowUnauthorizedError) as e:
+                        LOGGER.critical(
+                            "Permission error on %s: %s. Aborting this stream.",
+                            self.url_endpoint,
+                            e,
+                        )
+                        _raise_permission_error(e, self.tap_stream_id, self.url_endpoint)
 
                     raw_records = response.get(self.data_key, [])
+                    prev_page_dt, prev_page_sid = last_page_dt, last_page_sid
+                    readable_on_page = 0
 
                     for record in raw_records:
                         if isinstance(record, dict) and not record:
                             empty_record_count += 1
                             continue
+                        readable_on_page += 1
 
                         record = self.modify_object(record, parent_obj)
 
-                        record_dt: str = _to_snow_dt(record.get(replication_key) or bookmark_dt)
+                        raw_dt = record.get(replication_key)
                         record_sid: str = record.get("sys_id", "")
+
+                        # A record with no replication key cannot position the
+                        # cursor. Substituting bookmark_dt (the old behavior)
+                        # drove last_page_dt BACKWARDS to the bookmark, so the
+                        # next query rewound to the start of the range and
+                        # re-served the same page - the stream never advanced
+                        # and re-read the same rows on every future run. This
+                        # is reachable: field-level ACLs answer with HTTP 200
+                        # and the field simply omitted.
+                        if not raw_dt or not record_sid:
+                            skipped_uncursorable += 1
+                            continue
+
+                        # Not strict: one malformed row must not abort the
+                        # stream, and to_snow_dt warns before passing it through.
+                        record_dt: str = to_snow_dt(
+                            raw_dt, context=f"stream '{self.tap_stream_id}'"
+                        )
 
                         # Advance the keyset cursor to the last record on this page
                         last_page_dt = record_dt
@@ -371,12 +482,47 @@ class IncrementalStream(BaseStream):
                                     parent_obj=record,
                                 )
 
-                    has_more = len(raw_records) == page_size
+                    # Short pages are expected under ServiceNow row-level ACLs and
+                    # do NOT signal end-of-data (KB0727636); only an empty page
+                    # does. Stopping on a short page here silently drops records
+                    # the bookmark then skips over. The cursor-advance check
+                    # prevents an infinite loop on a page that yields no
+                    # advanceable (sys_updated_on, sys_id).
+                    cursor_advanced = (
+                        last_page_dt != prev_page_dt or last_page_sid != prev_page_sid
+                    )
+                    has_more = bool(raw_records) and cursor_advanced
 
-                state = write_bookmark(
-                    state, self.tap_stream_id, replication_key, current_max_dt
-                )
-                singer.write_state(state)
+                    # A non-empty page that does not advance the cursor leaves us
+                    # with nowhere to go: the next request would repeat this one.
+                    # Only an EMPTY page means end-of-data (KB0727636) - a page
+                    # with rows on it does not, whatever those rows contain. Two
+                    # ways to get here, both of which strand the sync mid-table:
+                    #
+                    #  - readable rows that repeat: sys_id is a unique primary
+                    #    key, so the same trailing (sys_updated_on, sys_id) twice
+                    #    means ServiceNow served the same page twice. That is what
+                    #    a query_range ACL denial looks like - HTTP 200 with the
+                    #    range clauses silently stripped from the query.
+                    #  - rows that are all masked to {}: field-level ACLs can
+                    #    leave a row with no readable fields, so the page carries
+                    #    no cursor value even though rows exist and more pages
+                    #    follow.
+                    #
+                    # Either way the bookmark must not move: everything past this
+                    # page would be skipped forever on a run reporting success.
+                    if raw_records and not cursor_advanced:
+                        cursor_stalled = True
+                        LOGGER.critical(
+                            "Stream '%s': keyset cursor did not advance past "
+                            "(%s, %s) on a page of %d row(s), %d of them readable. "
+                            "ServiceNow may be masking every row on the page, or "
+                            "dropping the range clauses from the query "
+                            "(query_range ACL). Stopping - this sync is "
+                            "INCOMPLETE and the bookmark will not be advanced.",
+                            self.tap_stream_id, last_page_dt, last_page_sid,
+                            len(raw_records), readable_on_page,
+                        )
 
                 if empty_record_count > 0:
                     LOGGER.warning(
@@ -384,11 +530,42 @@ class IncrementalStream(BaseStream):
                         "(possibly due to missing data-level permissions).",
                         self.tap_stream_id, empty_record_count
                     )
+
+                if skipped_uncursorable > 0:
+                    LOGGER.warning(
+                        "Stream '%s' skipped %d record(s) missing '%s' or "
+                        "'sys_id'. Those fields position the keyset cursor, so "
+                        "such records cannot be replicated incrementally - "
+                        "usually a field-level ACL hiding them.",
+                        self.tap_stream_id, skipped_uncursorable, replication_key
+                    )
+
+                if cursor_stalled:
+                    # Deliberately not writing the bookmark: re-reading this
+                    # range next run is cheap, skipping it is permanent. Raising
+                    # rather than returning a count, because a short record set
+                    # is indistinguishable from a completed sync to the caller.
+                    raise ServiceNowIncompleteSyncError(
+                        f"Stream '{self.tap_stream_id}' stopped before the end of "
+                        f"its data: the keyset cursor stalled at "
+                        f"('{last_page_dt}', '{last_page_sid}'). Bookmark left at "
+                        f"'{bookmark_dt}'; {counter.value} record(s) were emitted "
+                        f"but the table is NOT fully replicated."
+                    )
+
+                state = write_bookmark(
+                    state, self.tap_stream_id, replication_key, current_max_dt
+                )
+                singer.write_state(state)
                 return counter.value
+
+            except (ServiceNowForbiddenError, ServiceNowUnauthorizedError,
+                    ServiceNowIncompleteSyncError):
+                raise
 
             except ServiceNowError as e:
                 # A ServiceNow API error that exhausted retries or is non-retryable
-                # (e.g. 403 Forbidden). Log and skip this stream gracefully.
+                # (excluding permission failures). Log and skip this stream gracefully.
                 LOGGER.critical("Skipping stream '%s' due to: %s", self.tap_stream_id, e)
                 return 0
 

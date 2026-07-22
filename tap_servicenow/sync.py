@@ -3,6 +3,11 @@ from typing import Dict
 from singer import metadata
 from tap_servicenow.streams import STREAMS, abstracts
 from tap_servicenow.client import Client
+from tap_servicenow.exceptions import (
+    ServiceNowForbiddenError,
+    ServiceNowIncompleteSyncError,
+    ServiceNowUnauthorizedError,
+)
 from tap_servicenow.streams.abstracts import IncrementalStream, FullTableStream
 
 
@@ -79,6 +84,18 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
     last_stream = singer.get_currently_syncing(state)
     LOGGER.info("last/currently syncing stream: {}".format(last_stream))
 
+    # Streams whose sync aborted on a permission error. Collected rather than
+    # raised immediately so one unreadable table cannot cost us every stream
+    # after it: ServiceNow evaluates row-level ACLs after the query runs
+    # (KB0727636), so a table can pass the discovery probe and still 403
+    # part-way through a sync. The run still fails at the end (below) so the
+    # job is not reported as successful.
+    permission_failures = []
+    # Streams that stopped before the end of their data. Same isolation as
+    # permission failures: one stranded stream must not cost us the rest, but
+    # the run cannot report success either.
+    incomplete_streams = []
+
     with singer.Transformer() as transformer:
         for stream_name in streams_to_sync:
             stream = build_dynamic_stream(client, catalog.get_stream(stream_name))
@@ -91,7 +108,34 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
             write_schema(stream, client, streams_to_sync, catalog)
             LOGGER.info("START Syncing: {}".format(stream_name))
             update_currently_syncing(state, stream_name)
-            total_records = stream.sync(state=state, transformer=transformer)
+            try:
+                total_records = stream.sync(state=state, transformer=transformer)
+            except ServiceNowIncompleteSyncError as e:
+                LOGGER.critical("%s Continuing with the remaining streams.", e)
+                incomplete_streams.append(stream_name)
+                update_currently_syncing(state, None)
+                continue
+
+            except ServiceNowUnauthorizedError:
+                # 401 means the credentials themselves are dead, not that this
+                # one table is off limits. Every remaining stream would fail
+                # identically, so grinding through a 1,700-stream catalog to
+                # collect the same error 1,700 times helps nobody. Abort now.
+                LOGGER.critical(
+                    "Authentication failed while syncing stream '%s'. The "
+                    "credentials are invalid or expired - aborting the run "
+                    "rather than retrying every remaining stream.", stream_name
+                )
+                raise
+
+            except ServiceNowForbiddenError as e:
+                # 403 is per-table: this account cannot read THIS table, but
+                # the others may be fine. The stream raised before writing its
+                # bookmark, so nothing advanced past rows we never fetched.
+                LOGGER.critical("%s Continuing with the remaining streams.", e)
+                permission_failures.append(stream_name)
+                update_currently_syncing(state, None)
+                continue
 
             update_currently_syncing(state, None)
             LOGGER.info(
@@ -99,3 +143,42 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
                     stream_name, total_records
                 )
             )
+
+    # One aggregate failure describing BOTH categories. Raising on the first
+    # non-empty list would have hidden the other from the caller entirely: a
+    # run with stranded and forbidden streams reported only the stranded ones,
+    # leaving the permission failures in per-stream logs that nothing points
+    # at. The two need different operator responses (re-run vs request access),
+    # so a run that has both has to say so.
+    if incomplete_streams or permission_failures:
+        clauses = []
+        if incomplete_streams:
+            clauses.append(
+                "{} of {} selected stream(s) did not replicate fully: {}".format(
+                    len(incomplete_streams), len(streams_to_sync),
+                    ", ".join(incomplete_streams),
+                )
+            )
+        if permission_failures:
+            clauses.append(
+                "the account lacks 'read' access to {} of {} selected "
+                "stream(s): {}".format(
+                    len(permission_failures), len(streams_to_sync),
+                    ", ".join(permission_failures),
+                )
+            )
+
+        message = ". ".join(clauses)
+        message = (
+            message[0].upper() + message[1:] +
+            ". No bookmark was advanced for any affected stream, so their rows "
+            "are re-read on the next run. The remaining stream(s) synced "
+            "successfully."
+        )
+
+        # An incomplete sync outranks a permission failure: it means rows are
+        # missing from a table the account CAN read, which granting access will
+        # not fix. Both are named in the message either way.
+        if incomplete_streams:
+            raise ServiceNowIncompleteSyncError(message)
+        raise ServiceNowForbiddenError(message)

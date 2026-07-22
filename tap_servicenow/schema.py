@@ -124,6 +124,19 @@ def get_dynamic_schema(client) -> Tuple[Dict, Dict]:
     )
     schemas, field_metadata = builder.build(sync_tables)
 
+    # Tables dropped by something other than a permission denial (a 5xx that
+    # exhausted its retries, a timeout). These are NOT an access problem and
+    # must not be reported as one: the table was readable, we just failed to
+    # build it this run, and re-running discovery may well succeed.
+    errored_tables = builder.errored_tables
+    if errored_tables:
+        LOGGER.error(
+            "%d table(s) were excluded from the catalog because of errors, not "
+            "permissions. Re-run discovery to pick them up. Details: %s",
+            len(errored_tables),
+            "; ".join(f"{tbl}: {err}" for tbl, err in errored_tables[:20]),
+        )
+
     unauthorized_tables = builder.unauthorized_tables
     if unauthorized_tables:
         total   = len(sync_tables)
