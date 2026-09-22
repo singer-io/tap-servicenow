@@ -11,6 +11,7 @@ from tap_servicenow.client import (
     MAX_BACKOFF_SECONDS,
     RETRY_ON_TRANSIENT,
     retry_after_or_expo,
+    validate_instance,
 )
 from tap_servicenow.exceptions import (
     ServiceNowBadGatewayError,
@@ -80,6 +81,27 @@ class MockResponse:
         return self.text
 
 class TestClient(unittest.TestCase):
+
+    @parameterized.expand([
+        "instance",
+        "a",
+        "a1-b2",
+        "my-instance123",
+    ])
+    def test_accepts_valid_instance(self, instance):
+        validate_instance(instance)
+
+    @parameterized.expand([
+        "",
+        "-instance",
+        "instance-",
+        "instance_name",
+        "instance.example",
+        "https://instance",
+    ])
+    def test_rejects_invalid_instance(self, instance):
+        with self.assertRaises(ValueError):
+            Client({**default_config, "instance": instance})
 
     def setUp(self):
         """Set up the client with default configuration."""

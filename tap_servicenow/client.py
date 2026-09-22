@@ -1,3 +1,4 @@
+import re
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 import random
@@ -13,6 +14,17 @@ from tap_servicenow.exceptions import ERROR_CODE_EXCEPTION_MAPPING, ServiceNowEr
 
 LOGGER = get_logger()
 REQUEST_TIMEOUT = 300
+INSTANCE_PATTERN = re.compile(
+    r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$"
+)
+
+
+def validate_instance(instance: str) -> None:
+    """Reject ServiceNow instance values outside the hostname-label format."""
+    if not isinstance(instance, str) or not INSTANCE_PATTERN.fullmatch(instance):
+        raise ValueError(
+            "instance must contain only a valid ServiceNow hostname label"
+        )
 
 def raise_for_error(response: requests.Response) -> None:
     """Raises the associated response exception. Takes in a response object,
@@ -119,6 +131,7 @@ class Client:
 
     def __init__(self, config: Mapping[str, Any]) -> None:
         self.config = config
+        validate_instance(config["instance"])
         self._session = session()
         # Set once, not per request: requests.Session is not documented as
         # thread-safe and the discovery pool runs ten threads against this one
