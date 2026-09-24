@@ -87,6 +87,7 @@ class TestClient(unittest.TestCase):
         "a",
         "a1-b2",
         "my-instance123",
+        "a" * 63,
     ])
     def test_accepts_valid_instance(self, instance):
         validate_instance(instance)
@@ -98,6 +99,7 @@ class TestClient(unittest.TestCase):
         "instance_name",
         "instance.example",
         "https://instance",
+        "a" * 64,
     ])
     def test_rejects_invalid_instance(self, instance):
         with self.assertRaises(ValueError):

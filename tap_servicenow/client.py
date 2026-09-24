@@ -15,7 +15,7 @@ from tap_servicenow.exceptions import ERROR_CODE_EXCEPTION_MAPPING, ServiceNowEr
 LOGGER = get_logger()
 REQUEST_TIMEOUT = 300
 INSTANCE_PATTERN = re.compile(
-    r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$"
+    r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$"
 )
 
 
