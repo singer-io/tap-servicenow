@@ -1,5 +1,6 @@
 import re
 from typing import Any, Dict, Mapping, Optional, Tuple
+from urllib.parse import urlparse
 
 import random
 
@@ -137,9 +138,25 @@ class Client:
         # thread-safe and the discovery pool runs ten threads against this one
         # object. The credentials never change during a run.
         self._session.auth = HTTPBasicAuth(config["user"], config["password"])
-        self.base_url = f"https://{config['instance']}.service-now.com/api/now/table"
+        self.instance_domain = f"{config['instance']}.service-now.com"
+        self.base_url = f"https://{self.instance_domain}/api/now/table"
         config_request_timeout = config.get("request_timeout")
         self.request_timeout = float(config_request_timeout) if config_request_timeout else REQUEST_TIMEOUT
+
+    def _reject_untrusted_redirect(self, response: requests.Response) -> None:
+        """Reject redirects that leave the configured ServiceNow instance."""
+        if not getattr(response, "is_redirect", False):
+            return
+
+        location = (response.headers or {}).get("Location")
+        if not location:
+            raise ValueError("redirect response missing Location header")
+
+        redirect_host = (urlparse(location).hostname or "").lower()
+        if redirect_host != self.instance_domain.lower():
+            raise ValueError(
+                "redirect target must stay within the configured ServiceNow instance"
+            )
 
     def __enter__(self):
         self.check_api_credentials()
@@ -181,7 +198,9 @@ class Client:
         response = self._session.get(
             endpoint, headers=probe_headers, params=probe_params,
             timeout=self.request_timeout,
+            allow_redirects=False,
         )
+        self._reject_untrusted_redirect(response)
         raise_for_error(response)
         count_str = (response.headers.get("X-Total-Count") or "").strip()
         return int(count_str) if count_str.isdigit() else None
@@ -206,7 +225,14 @@ class Client:
         headers = headers or {}
         headers, params = self.authenticate(headers, params)
         url = f"{self.base_url}/{table}"
-        response = self._session.get(url, headers=headers, params=params, timeout=self.request_timeout)
+        response = self._session.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=self.request_timeout,
+            allow_redirects=False,
+        )
+        self._reject_untrusted_redirect(response)
         raise_for_error(response)
 
     def make_request(
@@ -231,7 +257,8 @@ class Client:
             headers=headers,
             params=params,
             data=body,
-            timeout=self.request_timeout
+            timeout=self.request_timeout,
+            allow_redirects=False,
         )
 
     @RETRY_ON_TRANSIENT
@@ -244,7 +271,8 @@ class Client:
             if method in ("GET", "POST"):
                 if method == "GET":
                     kwargs.pop("data", None)
-                response = self._session.request(method, endpoint, **kwargs)
+                response = self._session.request(method, endpoint, allow_redirects=False, **kwargs)
+                self._reject_untrusted_redirect(response)
                 raise_for_error(response)
             else:
                 raise ValueError(f"Unsupported method: {method}")
