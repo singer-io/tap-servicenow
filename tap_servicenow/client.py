@@ -258,7 +258,6 @@ class Client:
             params=params,
             data=body,
             timeout=self.request_timeout,
-            allow_redirects=False,
         )
 
     @RETRY_ON_TRANSIENT
